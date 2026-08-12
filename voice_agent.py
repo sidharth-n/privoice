@@ -38,6 +38,7 @@ from engines import (
     build_tts,
     build_turn_detector,
 )
+from turnlog import TurnMetrics, log_turn, summary_line
 
 # ─────────────────────────────── config ───────────────────────────────
 
@@ -456,15 +457,47 @@ class TTSPlayer:
         with self._lock:
             return not self._cancel.is_set()
 
-    def speak_sentence(self, sentence: str) -> None:
+    def speak_sentence(self, sentence: str) -> dict:
+        """Synthesize and play one sentence; return what it cost.
+
+        The returned `synth_ms` deliberately excludes time spent blocked in
+        `stream.write()`. Playback blocks for the real duration of the audio,
+        so a naive wall-clock measurement of this method reports roughly the
+        length of the sentence and tells you nothing about whether TTS is
+        keeping up. Timing only the generator separates "how fast can Kokoro
+        make audio" from "how long is the audio" — which is the distinction
+        `issues/0002` turns on, since the gap before sentence two is synthesis
+        happening after playback rather than during it.
+        """
         with self._lock:
             self._cancel.clear()
             cancel = self._cancel
 
+        m = {
+            "text": sentence,
+            "synth_first_ms": None,   # text in -> first audio chunk out
+            "synth_ms": 0.0,          # generator time only, no playback
+            "audio_s": 0.0,
+            "t_first_frame": None,    # perf_counter when audio hit the speaker
+        }
+        t_start = time.perf_counter()
+
         residual = np.zeros(0, dtype=np.float32)
-        for arr in self.tts.stream(sentence):
+        # Stepped by hand rather than with `for`, so the clock covers only the
+        # generator and stops while we are blocked writing to the device.
+        stream_iter = iter(self.tts.stream(sentence))
+        while True:
+            t_gen = time.perf_counter()
+            try:
+                arr = next(stream_iter)
+            except StopIteration:
+                m["synth_ms"] += (time.perf_counter() - t_gen) * 1000.0
+                break
+            m["synth_ms"] += (time.perf_counter() - t_gen) * 1000.0
+            if m["synth_first_ms"] is None:
+                m["synth_first_ms"] = (time.perf_counter() - t_start) * 1000.0
             if cancel.is_set():
-                return
+                return m
             if self.in_sr != self.out_sr:
                 arr = linear_resample(arr, self.in_sr, self.out_sr).astype(np.float32)
             buf = np.concatenate([residual, arr])
@@ -472,7 +505,7 @@ class TTSPlayer:
             n_full = len(buf) // APM_FRAME
             for i in range(n_full):
                 if cancel.is_set():
-                    return
+                    return m
                 frame_f32 = buf[i * APM_FRAME : (i + 1) * APM_FRAME]
                 frame_i16 = f32_to_i16(frame_f32)
                 if self.apm is not None:
@@ -484,7 +517,13 @@ class TTSPlayer:
                     )
                     self.apm.process_reverse_stream(af)
                 self._note_output(frame_f32)
+                # Stamped before the write, not after: `write` blocks until the
+                # device has room, so stamping after would fold one frame of
+                # playback into what is meant to be the moment sound started.
+                if m["t_first_frame"] is None:
+                    m["t_first_frame"] = time.perf_counter()
                 self.stream.write(frame_i16)
+                m["audio_s"] += APM_FRAME / self.out_sr
             residual = buf[n_full * APM_FRAME :]
 
         if len(residual) > 0 and not cancel.is_set():
@@ -500,7 +539,12 @@ class TTSPlayer:
                 )
                 self.apm.process_reverse_stream(af)
             self._note_output(tail)
+            if m["t_first_frame"] is None:
+                m["t_first_frame"] = time.perf_counter()
             self.stream.write(frame_i16)
+            m["audio_s"] += APM_FRAME / self.out_sr
+
+        return m
 
     def _note_output(self, frame_f32: np.ndarray) -> None:
         """Fold one outgoing frame into the output-level estimate.
@@ -590,9 +634,9 @@ def main() -> int:
 
     def turn_worker():
         while True:  # never returns — exiting is precisely what crashes
-            audio_buf, cancel = turn_q.get()
+            audio_buf, cancel, t_end = turn_q.get()
             try:
-                respond(audio_buf, models, history, player, cancel, state)
+                respond(audio_buf, models, history, player, cancel, state, t_end)
             except Exception as e:  # one bad turn must not kill the worker
                 print(f"\n[turn failed] {type(e).__name__}: {e}", flush=True)
             finally:
@@ -744,7 +788,10 @@ def main() -> int:
                         state["loud_streak"] = 0
                         state["barge_fired"] = False  # re-arm for the new reply
                         llm_cancel = threading.Event()
-                        turn_q.put((audio, llm_cancel))
+                        # Stamp end-of-speech here, not in the worker: the queue
+                        # hop and any backlog are latency the user experiences,
+                        # and starting the clock inside respond() would hide it.
+                        turn_q.put((audio, llm_cancel, time.perf_counter()))
                         models.vad.reset_states()
                 elif active:
                     speech_buf.append(v_chunk)
@@ -762,6 +809,23 @@ def main() -> int:
     return 0
 
 
+def _counted_tokens(token_iter, stats: dict, origin: float):
+    """Pass tokens through, recording when the first arrived and how many came.
+
+    Counts stream *deltas*, not tokenizer tokens — Ollama and Venice both emit
+    one delta per token in practice, but nothing guarantees it, so the field is
+    named `chunks` rather than `tokens` to keep an approximation from being
+    quoted as a measurement.
+    """
+    for tok in token_iter:
+        t = time.perf_counter()
+        if stats["ttft"] is None:
+            stats["ttft"] = (t - origin) * 1000.0
+        stats["chunks"] += 1
+        stats["last"] = (t - origin) * 1000.0
+        yield tok
+
+
 def respond(
     audio: np.ndarray,
     models: Models,
@@ -769,13 +833,37 @@ def respond(
     player: TTSPlayer,
     cancel: threading.Event,
     state: dict,
+    speech_end: float | None = None,
 ) -> None:
+    # Every stage time is measured from end-of-speech, because that is when the
+    # human starts waiting. `speech_end` is stamped in the mic loop; falling
+    # back to now() only loses the queue hop when a caller omits it.
+    t_end = speech_end if speech_end is not None else time.perf_counter()
+
+    m = TurnMetrics(
+        llm_backend=LLM_BACKEND,
+        llm_model=VENICE_LLM_MODEL if LLM_BACKEND == "venice" else LLM_MODEL,
+        stt_engine=models.stt.name,
+        tts_engine=models.tts.name,
+        audio_in_s=len(audio) / SR,
+        dispatch_ms=(time.perf_counter() - t_end) * 1000.0,
+    )
+
     t0 = time.perf_counter()
     user_text = transcribe_utterance(models.stt, audio)
     t_stt = time.perf_counter() - t0
+    m.stt_ms = t_stt * 1000.0
     if not user_text:
         print("(no speech detected)", flush=True)
+        # Still logged: a turn that cost STT time and produced nothing is a
+        # real cost the pipeline paid, and dropping those rows would quietly
+        # improve every average.
+        m.ok = False
+        m.error = "no_speech"
+        m.turn_total_ms = (time.perf_counter() - t_end) * 1000.0
+        log_turn(m)
         return
+    m.user_text = user_text
     # Log the audio length alongside the time. Without it, a slow STT reading is
     # ambiguous between "the model is slow" and "we handed it far too much
     # audio", and those have opposite fixes.
@@ -790,20 +878,37 @@ def respond(
 
     print("AI: ", end="", flush=True)
     full_reply: list[str] = []
-    first_audio_at: float | None = None
     t1 = time.perf_counter()
+    llm_stats = {"ttft": None, "chunks": 0, "last": None}
 
     interrupted = False
     try:
-        for sent in sentence_stream(stream_llm(history, models.client, cancel)):
+        tokens = _counted_tokens(stream_llm(history, models.client, cancel), llm_stats, t1)
+        for sent in sentence_stream(tokens):
             if cancel.is_set():
                 interrupted = True
                 break
             print(sent + " ", end="", flush=True)
-            if first_audio_at is None:
-                first_audio_at = time.perf_counter() - t1
+            if m.llm_first_sentence_ms is None:
+                m.llm_first_sentence_ms = (time.perf_counter() - t1) * 1000.0
             state["tts_audible"] = True   # audio is now hitting the speaker; barge-in legit
-            player.speak_sentence(sent)
+            sm = player.speak_sentence(sent)
+            m.sentences.append(
+                {
+                    "text": sent,
+                    "synth_first_ms": round(sm["synth_first_ms"], 2)
+                    if sm["synth_first_ms"] is not None
+                    else None,
+                    "synth_ms": round(sm["synth_ms"], 2),
+                    "audio_s": round(sm["audio_s"], 3),
+                }
+            )
+            if m.tts_first_ms is None:
+                m.tts_first_ms = sm["synth_first_ms"]
+            if m.first_audio_ms is None and sm["t_first_frame"] is not None:
+                m.first_audio_ms = (sm["t_first_frame"] - t_end) * 1000.0
+            m.tts_synth_ms += sm["synth_ms"]
+            m.tts_audio_s += sm["audio_s"]
             if cancel.is_set():
                 # Cut mid-sentence: the user heard part of this one at most, so
                 # recording it as spoken would put words in the agent's mouth
@@ -814,10 +919,26 @@ def respond(
             full_reply.append(sent)
     except Exception as e:
         print(f"\n[error] {e}", flush=True)
+        m.ok = False
+        m.error = f"{type(e).__name__}: {e}"
 
     print()
-    if first_audio_at is not None:
-        print(f"[ttfa {first_audio_at*1000:.0f}ms]", flush=True)
+    m.llm_ttft_ms = llm_stats["ttft"]
+    m.llm_total_ms = llm_stats["last"]
+    m.llm_chunks = llm_stats["chunks"]
+    if llm_stats["last"] and llm_stats["ttft"] is not None and llm_stats["chunks"] > 1:
+        # Decode rate excludes time-to-first-token: TTFT is queueing and prefill,
+        # and folding it in makes a fast decoder on a long prompt look slow.
+        decode_ms = llm_stats["last"] - llm_stats["ttft"]
+        if decode_ms > 0:
+            m.llm_chunk_s = (llm_stats["chunks"] - 1) / (decode_ms / 1000.0)
+    if m.tts_synth_ms > 0:
+        m.tts_rtf = m.tts_audio_s / (m.tts_synth_ms / 1000.0)
+    m.interrupted = interrupted
+    m.reply_text = " ".join(full_reply)
+    m.turn_total_ms = (time.perf_counter() - t_end) * 1000.0
+    print(summary_line(m), flush=True)
+    log_turn(m)
 
     if full_reply:
         text = " ".join(full_reply)

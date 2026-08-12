@@ -13,6 +13,10 @@ __pycache__/
 
 # Conversation memory (user-private)
 .voice_history.json
+# Per-turn latency log. Same privacy class as the history above — it carries
+# transcripts by default. Run with TURN_LOG_TEXT=0 to log timings only.
+# The analysis it produces belongs in docs/BENCHMARK.md; the raw rows do not.
+turn_log.jsonl
 
 # Test/output artifacts
 out_reply.wav

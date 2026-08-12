@@ -91,6 +91,27 @@ HALF_DUPLEX=1 uv run python voice_agent.py
 | `STT_ENGINE` | `parakeet` | See stack table for alternates. |
 | `TTS_ENGINE` | `kokoro` | — |
 | `TURN_DETECTOR` | `off` | `smartturn` enables Smart Turn v3.2 semantic end-of-turn. **Leave off** — see `issues/0005`. |
+| `TURN_LOG` | `turn_log.jsonl` | Where per-turn latencies are appended. `off` disables. |
+| `TURN_LOG_TEXT` | `1` | `0` logs stage timings without transcripts. |
+
+## Measuring real conversations
+
+Every live turn appends one row to `turn_log.jsonl` (gitignored — it carries
+transcripts). A conversation is therefore also a benchmark run, which matters
+because `bench_stack.py` measures slots in isolation on a fixed prompt and the
+live pipeline behaves differently — `issues/0004` exists because STT is 5–10×
+slower in the pipeline than on its own.
+
+```bash
+uv run python scripts/analyze_turns.py            # medians + p90 per stage, grouped by config
+uv run python scripts/analyze_turns.py --raw      # one line per turn
+uv run python scripts/smoke_turnlog.py --turns 4  # regression test, no mic needed
+```
+
+Every duration is measured from **end-of-speech**, because that is when the
+person starts waiting. The old `[ttfa]` print started its clock after STT had
+already run and so understated the wait; `first_audio_ms` is the honest number
+and equals `dispatch + stt + llm_first_sentence + tts_first` by construction.
 
 ## Critical gotchas
 
@@ -108,6 +129,9 @@ HALF_DUPLEX=1 uv run python voice_agent.py
 ```
 voice_agent.py            # main pipeline (~730 LOC)
 engines.py                # swappable STT / TTS / turn-detector slots (~380 LOC)
+turnlog.py                # per-turn latency record written by every live turn
+scripts/analyze_turns.py  # turn_log.jsonl -> per-stage medians/p90 by config
+scripts/smoke_turnlog.py  # multi-turn regression test for the turn path + log
 scripts/bench_stack.py    # per-slot latency benchmark (STT / LLM / TTS)
 scripts/bench_llm_mlx.py  # same LLM metrics for an MLX-format model
 scripts/compare_stt.py    # WER-scored STT comparison on real speech
