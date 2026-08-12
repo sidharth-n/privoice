@@ -1,4 +1,4 @@
-# venice-voice-agent
+# Privoice
 
 A real-time voice agent. Mic in → spoken reply out. Every slot (STT, LLM, TTS)
 runs either on-device or on Venice's hosted API, selected by env var. Forked
@@ -69,7 +69,7 @@ Available alternates: `STT_ENGINE` = `parakeet` (default) · `nemotron` · `nemo
 ## Run
 
 ```bash
-cd ~/Developer/Personal/uncensored-local-voice
+cd ~/Developer/Personal/privoice
 
 # default: full-duplex with AEC + barge-in
 uv run python voice_agent.py

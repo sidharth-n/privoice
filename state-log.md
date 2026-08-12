@@ -1,6 +1,6 @@
 # Session log (older handoffs, newest first)
 
-> Everything below predates the fork to venice-voice-agent on 2026-08-12,
+> Everything below predates the fork to privoice on 2026-08-12,
 > when this project was `uncensored-local-voice`.
 
 _Last updated: 2026-07-30_

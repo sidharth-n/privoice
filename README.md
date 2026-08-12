@@ -1,4 +1,4 @@
-# venice-voice-agent
+# Privoice
 
 A real-time voice agent for Apple Silicon whose every slot — speech-to-text,
 LLM, text-to-speech — swaps by env var between **on-device** and
