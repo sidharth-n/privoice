@@ -5,6 +5,86 @@ how the project gets smarter rather than repeating itself.
 
 ---
 
+## 2026-08-12 · An optimisation that cannot be observed will be silently a no-op
+
+**Context:** Speculative dispatch — starting STT and the LLM during Silero's
+end-of-speech window — was implemented, reviewed, and looked right. It did
+nothing. Silero clears `temp_end` in *two* situations: when the user resumes
+speaking, and when it emits its own `end` event. The abort check only looked at
+`temp_end`, so every single guess was thrown away exactly one frame before the
+commit that would have used it. The feature was 100% dead and the code read as
+correct.
+
+**Rule:** An optimisation needs a number that goes to zero when it stops
+working, and that number has to be visible on every run. `spec_lead_ms` is
+logged per turn precisely so "speculation is on" and "speculation is helping"
+cannot be confused; the bug was found the moment a harness printed it, not by
+reading the code. If a feature's only evidence is that the code looks right,
+it is untested by construction.
+
+**Example:** the discriminator was one term — `triggered` survives a resume and
+clears on end. But the reason it took a harness to find is that the loop had
+never been runnable without a microphone, so the only way to exercise
+turn-taking was to talk to the agent and form an impression. Making
+`run_conversation()` take its frames from an iterator turned a class of bug from
+unobservable into a script.
+
+**Related:** the same shape as "component tests cannot catch conversation bugs"
+below, one level up: that lesson was about tests missing bugs, this one is about
+a *feature* being missing and nothing noticing.
+
+---
+
+## 2026-08-12 · Fix the workload before trying to fix the engine
+
+**Context:** The goal was to cut first-audio from 1,699 ms to under 1,300 ms.
+The obvious target was the LLM at 1,076 ms — 63% of the budget. It turned out to
+be immovable: nine Venice models from 30B-A3B to 405B all return their first
+token in 850–1,100 ms, raw RTT is 39 ms, and connection reuse (an obvious
+suspect, httpx expires keepalives after 5 s and turns are further apart than
+that) measured as noise. Not one of the plausible engine-level fixes was real.
+
+Every millisecond actually won came from changing *what the pipeline was asked
+to do*, not how fast anything ran: tell the model to open with a short sentence
+(TTS 481 → 268 ms), synthesize later sentences underneath audio already playing
+(gap 293 → 0 ms), and start the work 342 ms earlier during a window that was
+already being spent waiting.
+
+**Rule:** When a stage looks like the bottleneck, first measure whether it has a
+floor. If it does, stop optimising it and start removing work from in front of
+it, moving work off its critical path, or shrinking the input you hand it. A
+floor is a fact about the world; the workload is a choice, and choices are
+cheaper to change.
+
+**Example:** the single largest win was a **prompt edit**. "Your FIRST sentence
+must be under 8 words" cut the opener from 46 to 19 characters median and killed
+the 108-character p90 that was producing the pipeline's 2,757 ms p90. No code,
+no model change, no new dependency.
+
+---
+
+## 2026-08-12 · A metric can be invalidated by the fix it was written to measure
+
+**Context:** `issues/0002`'s gap was measured as the synthesis time of later
+sentences. That was a valid proxy only while synthesis happened *after* playback
+finished. Once synthesis moved to run ahead of the speaker, the same field
+measured work happening *underneath* audio the listener was already hearing —
+and the first post-fix run duly reported the gap getting **worse**, 293 ms to
+685 ms, on a change that had actually eliminated it.
+
+**Rule:** When you fix the thing a metric was invented to detect, check whether
+the metric still measures it. Proxies encode an assumption about the system's
+shape, and the fix is usually a change to exactly that shape. Measure the
+user-visible quantity directly instead — here, first-frame(N+1) minus
+last-frame(N), stamped by the playback thread: 0 ms.
+
+**Example:** old and new rows are reported under **different labels** rather
+than pooled, because they are not the same measurement. Pooling them would have
+averaged a real 0 ms against a stale 293 ms and understated the fix — the mirror
+image of the error it nearly caused.
+
+---
+
 ## 2026-08-12 · A lexicon TTS can delete words instead of mispronouncing them
 
 **Context:** The launch video's narration never said "Privoice", and the demo reply never

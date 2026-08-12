@@ -1,12 +1,12 @@
 ---
 id: 0010
 title: TTS time-to-first-audio scales linearly with first-sentence length (~9 ms/char)
-status: open
+status: closed
 priority: moderate
 area: tts/latency
 opened: 2026-08-12
 updated: 2026-08-12
-closed:
+closed: 2026-08-12
 ---
 
 ## What
@@ -68,3 +68,31 @@ Cheapest first, and the first one may be enough:
 
 Interacts with `issues/0009` and `issues/0002` — all three are about audio
 starting later than the data allows.
+
+## Resolved — 2026-08-12
+
+Approach 1 was enough. The old prompt constrained the *reply* ("1 short
+sentence, sometimes 2") and left the opener free; the new one names the first
+sentence specifically and pushes detail into later sentences.
+
+Measured over 10 varied prompts against `venice-uncensored`:
+
+| prompt | opener median | p90 | max | projected TTS first-audio |
+|---|---|---|---|---|
+| old | 46 chars | 108 | 142 | 481 ms |
+| new | **19 chars** | **31** | **35** | **268 ms** |
+
+The tail matters more than the median here: the p90 of 108 characters is what
+produced the pipeline's 2,757 ms p90 first-audio, and it is gone.
+
+Measured end to end, TTS first-audio fell from 302/813/1115 ms to 140/159/179 ms
+on the same smoke prompts, and to 194 ms median over 20 replayed turns.
+
+This is only affordable because `issues/0002` landed first. Later sentences are
+now synthesized underneath audio that is already playing, so their length costs
+nothing — before that change, "put the detail later" would have moved the cost
+rather than removed it.
+
+Approaches 2 and 3 (splitting the first sentence at a clause boundary, and
+checking whether kokoro can stream within a sentence) were not needed and remain
+available if the opener ever has to get shorter still.

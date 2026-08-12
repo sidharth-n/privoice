@@ -755,7 +755,7 @@ class TTSPlayer:
 # ─────────────────────────────── main loop ────────────────────────────
 
 
-def main() -> int:
+def main() -> None:
     models = load_models()
     warmup(models)
 
@@ -798,7 +798,17 @@ def main() -> int:
         models.stt.close()
         models.tts.close()
         models.turn.close()
-    return 0
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+    # Leave without running interpreter finalization (`issues/0008`). Every
+    # long-lived thread here is a daemon, and MLX keeps thread-local Metal
+    # state whose destruction calls back into Python without the GIL — which
+    # printed a `Fatal Python error: PyThreadState_Get` block *after* "bye",
+    # alongside a leaked-semaphore warning. Nothing is lost: the history is
+    # saved and the devices are closed immediately above. The scripts under
+    # scripts/ already exit this way for the same reason.
+    os._exit(0)
 
 
 def run_conversation(
@@ -1367,4 +1377,4 @@ def speak_reply(
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()  # never returns; see the os._exit at the end of main()

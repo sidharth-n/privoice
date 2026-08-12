@@ -2,10 +2,10 @@
 id: 0004
 title: STT is 5-10x slower in the live pipeline than in isolation
 status: open
-priority: moderate
+priority: low
 area: stt/threading
 opened: 2026-07-30
-updated: 2026-07-30
+updated: 2026-08-12
 closed:
 ---
 
@@ -62,3 +62,53 @@ Note the isolated numbers were what justified making Parakeet the default over
 Moonshine (396 ms). Even at live cost, Parakeet still wins — Moonshine measured
 812-1626 ms in the same live conditions — so the decision stands, but the margin is
 smaller than the benchmark implied.
+
+## Re-measured 2026-08-12 — mostly not reproducible
+
+Chased every hypothesis above. The 5–10x systematic slowdown does not reproduce;
+what is left is an occasional spike.
+
+**Isolated, on real `say` speech** (not the synthetic tones an earlier probe
+used — Parakeet is a transducer and it was worth ruling out that decode cost
+tracks what it emits; it does not, silence and speech of equal length cost the
+same):
+
+```
+ 2.0-2.5s clips -> 48-52 ms, tight across 5 runs each
+ 5.4s clip      -> 84 ms
+```
+
+**Contention, added one layer at a time in a single process**, transcribing the
+same 2.4 s clip:
+
+```
+A. nothing else running                       82 ms
+B. + OutputStream open, idle                  89 ms
+C. + InputStream running (mic callbacks)      72 ms
+D. + mic queue drained on a thread            90 ms
+E. + APM + Silero VAD per frame (real loop)   46 ms
+```
+
+Hypothesis 1 (main-thread/worker contention) is therefore wrong — the full
+real-loop configuration was the *fastest* of the five. Hypothesis 3 (temp-wav
+overhead) is wrong: the write is 0.2 ms median. Hypothesis 2 (cold Metal kernels
+per call) is wrong: a warmup ladder across five durations made no difference to
+first-call cost, and a 6 s idle gap between calls costs ~20 ms.
+
+**In the live loop**, across 30 replayed turns, STT is 74 ms median / 49 ms min.
+Two of three runs showed no spikes at all; one run showed five turns at
+390–528 ms. That run was initially blamed on speculative dispatch and it was not
+— re-running with speculation on reproduced 66 ms median with no spikes, and the
+spec-off control ran in between. Machine state, not the pipeline.
+
+## Where that leaves it
+
+The original evidence (1004 ms on 1.1 s of audio) came from a session in
+2026-07-30 that also predates the current threading model, and STT was 5–10x
+slower then in a way it is not now. Dropped to low priority: the median is
+within 30 ms of isolated, STT is 7% of the critical path, and there is no
+reproducible defect to fix.
+
+Worth keeping open only for the spikes. If they matter, the thing to capture is
+what else the machine was doing — this needs a reproduction before it needs a
+hypothesis.

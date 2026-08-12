@@ -1,12 +1,12 @@
 ---
 id: 0002
 title: Audible gap before the second sentence (TTS generates synchronously)
-status: open
+status: closed
 priority: urgent
 area: tts/playback
 opened: 2026-07-30
-updated: 2026-07-30
-closed:
+updated: 2026-08-12
+closed: 2026-08-12
 ---
 
 ## What
@@ -52,3 +52,25 @@ Decouple generation from playback:
 
 Do not attempt alongside other changes — this touches the mechanism [[0001]] depends
 on.
+
+## Resolved — 2026-08-12
+
+Synthesis and playback shared a thread, so sentence two could not begin
+synthesizing until sentence one had finished *playing*. Device writes moved to a
+dedicated playback thread (`TTSPlayer._play_loop`); synthesis now runs up to
+`TTS_MAX_AHEAD` (2) sentences ahead of the speaker.
+
+`issues/0009` had to land first, and did: pre-synthesizing sentence two is
+pointless while its tokens have not been requested.
+
+The metric changed with the fix, which matters when comparing rows. The old
+number used the synthesis time of later sentences as a proxy for the gap — valid
+only while synthesis happened *after* playback. It is now measured directly as
+first-frame(N+1) minus last-frame(N), both stamped by the playback thread, and
+logged as `gap_ms`. `analyze_turns.py` reports the two under separate labels so
+the fix cannot be read as a regression.
+
+    gap heard between sentences: 0 ms median over 41 sentences   (was 293 ms)
+
+TTS realtime factor also rose from ~6.3x to ~9-11x, because synthesis is no
+longer interleaved with blocking device writes.

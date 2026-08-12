@@ -47,12 +47,34 @@ medians. Method, controls and limits: **[docs/BENCHMARK.md](docs/BENCHMARK.md)**
 
 Those are per-slot measurements on a fixed short prompt. **A real conversation
 is slower**: 34 live turns on the hybrid config measured **1,699 ms median /
-2,757 ms p90** to first audio. The ranking holds, the magnitude does not — and
-the gap is almost entirely in the two local slots, which take ~15 turns to warm
-up (2,196 ms over the first half of the session, 1,497 ms over the second)
-while the hosted LLM is flat from turn one. Every live turn now logs its own
-breakdown, so this is measured rather than assumed; see
-[docs/BENCHMARK.md](docs/BENCHMARK.md#what-a-real-conversation-measures--and-why-it-is-16-the-synthetic-number).
+2,757 ms p90** to first audio. The ranking holds, the magnitude does not. Every
+live turn logs its own breakdown, so this is measured rather than assumed.
+
+### Then the conversation number was fixed, not just measured
+
+Instrumenting real turns showed the wait was not where the per-slot benchmark
+said it was, and almost none of it was fixable by making a model faster. After
+the work in `issues/0002`, `0009`, `0010` and speculative dispatch — **20 turns
+through the real turn-taking loop now measure 1,112 ms median / 1,463 ms p90**:
+
+| | before | after |
+|---|---|---|
+| First audio, median | 1,699 ms | **1,112 ms** |
+| First audio, p90 | 2,757 ms | **1,463 ms** |
+| Gap heard between sentences | 293 ms | **0 ms** |
+| Decode rate, multi-sentence replies | 5.8 chunks/s | **106 chunks/s** |
+
+Nothing here is a faster model. The LLM is a hard floor — nine Venice models
+from 30B-A3B to 405B all return their first token in 850–1,100 ms — so the wins
+came from changing the workload instead: **ask the model for a short opening
+sentence** (time-to-first-audio scales at ~7.9 ms per character), **synthesize
+later sentences underneath audio already playing**, and **start transcribing and
+generating during the 500 ms the voice-activity detector spends confirming you
+have stopped talking**, which was previously dead time nobody was counting.
+
+Method, controls and limits: **[docs/BENCHMARK.md](docs/BENCHMARK.md)**. The
+after-figures come from `say`-synthesized speech driven through the real loop —
+cleaner than a room, no echo path, one voice — so treat them as a floor.
 
 Three results, and the first two were not what I expected.
 

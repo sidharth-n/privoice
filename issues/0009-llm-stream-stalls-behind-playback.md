@@ -1,12 +1,12 @@
 ---
 id: 0009
 title: LLM stream is not drained while audio plays — sentence 2 is never requested early
-status: open
+status: closed
 priority: urgent
 area: llm/playback
 opened: 2026-08-12
 updated: 2026-08-12
-closed:
+closed: 2026-08-12
 ---
 
 ## What
@@ -69,3 +69,25 @@ Constraints that must survive the change:
 
 Land this before `issues/0002`: pre-synthesizing sentence two is pointless
 while its tokens are still unrequested.
+
+## Resolved — 2026-08-12
+
+`LlmStreamer` drains the token stream on a long-lived thread into a queue; the
+sentence splitter consumes from the queue, so playback blocks the consumer
+without blocking the producer.
+
+    decode rate, multi-sentence replies: 106 chunks/s median   (was 5.8)
+
+which agrees with the ~115 tok/s `bench_stack.py` measures for the same model
+with no playback in the loop — confirming the old figure was backpressure, and
+that `llm_chunk_s` now measures the model on every turn rather than only on
+single-sentence ones.
+
+The constraints held: the producer thread owns no MLX state and never exits, and
+the cancel `threading.Event` reaches it (checked after every token).
+
+One thing this exposed only later: `stream()` had to stop being a generator
+function. A generator body does not run until first advanced, so the request did
+not leave the machine until someone pulled a token — harmless here, fatal to
+speculative dispatch, which depends on the call being in flight before anyone
+asks for a token.

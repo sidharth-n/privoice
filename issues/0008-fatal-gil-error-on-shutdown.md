@@ -1,12 +1,12 @@
 ---
 id: 0008
 title: Fatal GIL error printed on Ctrl+C shutdown (cosmetic)
-status: open
+status: closed
 priority: low
 area: threading
 opened: 2026-07-30
-updated: 2026-07-30
-closed:
+updated: 2026-08-12
+closed: 2026-08-12
 ---
 
 ## What
@@ -41,3 +41,15 @@ destructed. The second is ugly but appropriate for a process whose job is finish
 avoids depending on MLX's teardown behaviour.
 
 Low priority; do not bundle with audio changes.
+
+## Resolved — 2026-08-12
+
+Took the blunt option this issue already recommended: `main()` closes the audio
+devices and engines, saves history, flushes, and then calls `os._exit(0)` rather
+than returning into interpreter finalization. Every long-lived thread in the
+process is a daemon and none of them need to run anything on the way out, so
+there is nothing to lose by skipping teardown — and it removes the dependency on
+MLX's destruction behaviour entirely.
+
+The scripts under `scripts/` already exited this way for the same reason; this
+just makes the agent consistent with them.

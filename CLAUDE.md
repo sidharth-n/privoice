@@ -6,20 +6,34 @@ runs either on-device or on Venice's hosted API, selected by env var. Forked
 
 **Measured latency (2026-08-12, this M5 — see `docs/BENCHMARK.md`):**
 
-- *Synthetic, per-slot, 5 samples* (`scripts/bench_stack.py`): all-local
-  1,642 ms · all-Venice 3,672 ms · **hybrid 1,381 ms**. Cold start, the
-  realistic first turn: local 7,824 ms vs hybrid 1,381 ms.
-- *Real conversation, 34 turns, hybrid* (`turn_log.jsonl`): **1,699 ms median,
-  2,757 ms p90** to first audio; ~1,497 ms once warm. Quote the synthetic
-  figure as a per-slot measurement, never as conversational latency.
+Current, hybrid, 20 turns through the real turn-taking loop
+(`scripts/replay_conversation.py`): **1,112 ms median, 1,463 ms p90** to first
+audio. Breakdown: STT 74 ms · LLM first sentence 1,011 ms · TTS first audio
+194 ms · minus 342 ms median of work done before the clock starts.
 
-The ranking is unchanged (hybrid wins); the magnitude is not. The local slots
-warm up over ~15 turns (STT 382→178 ms, TTS 546→303 ms) while the hosted LLM is
-flat, so a short sample describes a system nobody experiences for long.
+Before this session's latency work it was 1,699 ms median / 2,757 ms p90. What
+moved it, none of it by making any model faster:
 
-The original "<1 s warm" claim from the local build was never met — see
-`issues/0003`. The LLM's **first-sentence** time is the dominant cost, and
-time-to-first-token is not a proxy for it.
+| change | effect |
+|---|---|
+| speculative dispatch (`SPECULATE`) | −342 ms median |
+| short-opener prompt (`issues/0010`) | TTS first-audio 481 → 268 ms projected |
+| overlap decode + synthesis with playback (`0009`, `0002`) | inter-sentence gap 293 → 0 ms |
+
+**The LLM is a floor, not a lever.** Time-to-first-token is ~850–1,000 ms for
+*every* Venice model tested, from a 30B-A3B MoE to a 405B, while raw RTT is
+39 ms and connection reuse buys nothing. Do not re-open this as a model swap —
+`issues/0003` records the nine models measured.
+
+Rules for quoting numbers here:
+- `bench_stack.py` figures are **per-slot, synthetic**. Never quote them as
+  conversational latency. (Historic: all-local 1,642 ms · all-Venice 3,672 ms ·
+  hybrid 1,381 ms; cold local 7,824 ms.)
+- Replay figures come from `say`-synthesized speech: cleaner than a room, no
+  echo path, one voice. They are a floor, not a promise. A real mic session is
+  still the ground truth.
+- Local slots warm up over ~15 turns while the hosted LLM is flat, so short
+  samples describe a system nobody experiences for long.
 
 **Working rules for this repo:**
 - The local path is the default and must stay working. Hosted slots are additive.
@@ -35,20 +49,29 @@ time-to-first-token is not a proxy for it.
 
 ```
 mic 16kHz/10ms ─► WebRTC AEC (livekit.rtc) ─► Silero VAD ─► Parakeet TDT v3 STT
-                            ▲                                        │
-                            │ reverse-stream reference               ▼
-                  ┌─ resampled 24→16kHz ──┐                  Ollama /api/chat
-                  │                       │                  (think:false,
-                  │                       │                   keep_alive:30m)
-              speakers ◄── KokoroTTS ─────┘                          │
-                                                          sentence_stream
-                                                                    │
-                                                                    ▼
-                                                              KokoroTTS
-                                                              (per-sentence)
+                            ▲                       │                │
+                            │ reverse-stream        │ 200ms of       ▼
+                            │ reference             │ silence ─►  LLM call
+                  ┌─ resampled 24→16kHz ──┐         │             (started
+                  │                       │         │              early)
+              speakers ◄── playback ◄── KokoroTTS    │                │
+                            thread      (up to 2   end-of-turn    LlmStreamer
+                                       sentences     confirmed    drain thread
+                                         ahead)          │             │
+                                            ▲            └─► commit ───┤
+                                            └──────── sentence_stream ─┘
 ```
 
-Every engine slot is swappable by env var — see `engines.py`.
+Four threads, and the split is the point:
+
+- **mic loop** — AEC, VAD, barge-in, and deciding when to speculate.
+- **turn worker** — owns every MLX model (STT + TTS). Persistent and never
+  exits: thread-local Metal state torn down on exit kills the interpreter.
+- **LLM drain** — reads the token stream eagerly so playback cannot stall it.
+- **playback** — writes 10 ms frames to the device, so synthesis can run ahead.
+
+The two drain/playback threads deliberately touch no MLX state. Every engine
+slot is swappable by env var — see `engines.py`.
 
 ## Stack
 
@@ -63,8 +86,10 @@ Every engine slot is swappable by env var — see `engines.py`.
 | Audio I/O | **sounddevice** | PortAudio bindings |
 
 Available alternates: `STT_ENGINE` = `parakeet` (default) · `nemotron` · `nemotron-8bit` ·
-`whisper` · `moonshine` · any mlx-audio repo id. `TTS_ENGINE` = `kokoro`.
-`TURN_DETECTOR` = `off` (default) · `smartturn`.
+`whisper` · `moonshine` · `venice` · any mlx-audio repo id.
+`TTS_ENGINE` = `kokoro` (default, via mlx-audio's `KokoroPipeline`) ·
+`kokoro-legacy` (the old `kokoro_mlx` path — **drops proper nouns**, see
+`issues/0011`) · `venice`. `TURN_DETECTOR` = `off` (default) · `smartturn`.
 
 ## Run
 
@@ -101,6 +126,12 @@ HALF_DUPLEX=1 uv run python voice_agent.py
 | `TURN_DETECTOR` | `off` | `smartturn` enables Smart Turn v3.2 semantic end-of-turn. **Leave off** — see `issues/0005`. |
 | `TURN_LOG` | `turn_log.jsonl` | Where per-turn latencies are appended. `off` disables. |
 | `TURN_LOG_TEXT` | `1` | `0` logs stage timings without transcripts. |
+| `SPECULATE` | `1` | Start STT + the LLM during the VAD silence window. `0` restores the pre-2026-08-12 path exactly. |
+| `SPECULATE_AFTER_MS` | `200` | Silence before a reply is started speculatively. Lead = `VAD_MIN_SILENCE_MS` − this. Lower buys more, and wastes more hosted calls on mid-sentence pauses. |
+| `SPEC_DEBUG` | `0` | `1` prints when a guess is made and whether the commit reused it. |
+| `TTS_MAX_AHEAD` | `2` | Sentences that may sit synthesized ahead of the speaker. |
+| `TTS_SPEED` | `1.0` | Kokoro speaking rate. |
+| `KOKORO_ALLOW_NO_ESPEAK` | `0` | `1` runs without the espeak fallback, accepting that out-of-lexicon words are **silently deleted**. See `issues/0011`. |
 
 ## Measuring real conversations
 
@@ -114,6 +145,11 @@ slower in the pipeline than on its own.
 uv run python scripts/analyze_turns.py            # medians + p90 per stage, grouped by config
 uv run python scripts/analyze_turns.py --raw      # one line per turn
 uv run python scripts/smoke_turnlog.py --turns 4  # regression test, no mic needed
+
+# a whole conversation through the REAL turn-taking loop, no mic — this is the
+# only harness that exercises VAD, end-of-turn, barge-in and speculation
+LLM_BACKEND=venice uv run python scripts/replay_conversation.py --turns 10
+LLM_BACKEND=venice SPECULATE=0 uv run python scripts/replay_conversation.py  # control
 ```
 
 Every duration is measured from **end-of-speech**, because that is when the
@@ -130,15 +166,20 @@ and equals `dispatch + stt + llm_first_sentence + tts_first` by construction.
 5. **History balloons → TTFA balloons.** 20 turns can push TTFA past 5 s. The cap (`HISTORY_MAX_TURNS=8`) is enforced both at load and after every turn.
 6. **One persistent worker thread, never one per turn.** MLX keeps thread-local Metal state; destroying it on thread exit kills the interpreter (`PyThreadState_Get: ... the GIL is released`). This was fatal on turn 2 once a second MLX model was added.
 7. **Published latency numbers are useless here — measure on this machine.** `scripts/bench_stack.py` (per slot) and `scripts/compare_stt.py` (real speech, WER-scored) exist for that. The metric that matters is **time-to-first-sentence**, not TTFT: TTS is driven per sentence, and the two differ ~3–4× on the same model.
-8. **Component tests cannot catch conversation bugs.** Anything touching turn-taking, buffering or threading must be exercised by `scripts/smoke_multiturn.py` (multi-turn + worker thread). `smoke_pipeline.py` runs one turn on the main thread and is structurally blind to this class of bug.
+8. **Component tests cannot catch conversation bugs.** Anything touching turn-taking, buffering or threading must be exercised by `scripts/smoke_multiturn.py` (multi-turn + worker thread) and, if it touches VAD or end-of-turn, by `scripts/replay_conversation.py` (the real `run_conversation` loop). `smoke_pipeline.py` runs one turn on the main thread and is structurally blind to this class of bug. Speculative dispatch was silently a no-op — every guess discarded one frame before it would have been used — until the replay harness existed to show it.
+9. **Kokoro deletes words it doesn't know, it does not mispronounce them.** Out-of-lexicon words phonemize to `''` and synthesize as *silence*. The default engine wires espeak as a fallback and refuses to start without it; `scripts/smoke_tts_lexicon.py` guards it. See `issues/0011`.
+10. **`first_audio_ms` starts when Silero *reports* end-of-speech**, which is `VAD_MIN_SILENCE_MS` after the user actually stopped. The felt wait is that much longer than the logged number. Speculative dispatch spends that window rather than shortening it, so it improves both — but do not confuse the two when quoting.
 
 ## Files
 
 ```
-voice_agent.py            # main pipeline (~730 LOC)
-engines.py                # swappable STT / TTS / turn-detector slots (~380 LOC)
+voice_agent.py            # main pipeline; run_conversation() is the turn-taking loop
+engines.py                # swappable STT / TTS / turn-detector slots
 turnlog.py                # per-turn latency record written by every live turn
 scripts/analyze_turns.py  # turn_log.jsonl -> per-stage medians/p90 by config
+scripts/replay_conversation.py # a whole conversation through the real loop, no mic
+scripts/smoke_speculate.py     # speculative dispatch: reuse / discard / off
+scripts/smoke_tts_lexicon.py   # TTS must not silently delete unknown words
 scripts/smoke_turnlog.py  # multi-turn regression test for the turn path + log
 scripts/bench_stack.py    # per-slot latency benchmark (STT / LLM / TTS)
 scripts/bench_llm_mlx.py  # same LLM metrics for an MLX-format model

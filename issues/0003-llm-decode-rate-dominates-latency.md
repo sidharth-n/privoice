@@ -1,160 +1,115 @@
 ---
 id: 0003
-title: LLM decode rate dominates latency — swap to a 3B-active MoE
+title: LLM time-to-first-token is the pipeline's floor, and it is not a decode-rate problem
 status: open
-priority: urgent
+priority: moderate
 area: llm
 opened: 2026-07-30
-updated: 2026-07-30
+updated: 2026-08-12
 closed:
 ---
 
-## What
+## History — this issue was wrong twice, in different ways
 
-The LLM is the largest remaining latency cost. Time-to-first-audio sat at
-2248-3647 ms in live use, and roughly a second of that is the model producing its
-first sentence.
+**As originally written (2026-07-30)** it said: "the LLM is slow because it's
+dense — swap in a sparse 3B-active MoE, expect ~3.7x", and was marked urgent.
+`learning.md` records the disproof: the model already in use *was* a sparse MoE
+(`expert_count 128`, `expert_used_count 8`, 100% GPU) that simply decodes at
+dense speed, and three of the issue's supporting claims were false — the
+recommended tag has no `latest` and cannot be pulled, its real size is 23.94 GB
+not 17 GB (above this machine's ~24 GiB wired limit, so it would have run
+*slower*), and the 17 GB figure belonged to a dense variant.
 
-## Why it matters
+**The framing was also wrong.** The title said decode rate dominates latency.
+It does not, and never did on the hosted path. Rewritten 2026-08-12 against
+measurements rather than a plan.
 
-Every other slot is now small: STT 64-230 ms, TTS TTFA ~300 ms, turn detection 19 ms.
-Nothing else on the roadmap buys as much.
+## What is actually true
 
-## Evidence
-
-`scripts/bench_stack.py`, current model
-(`0xIbra/supergemma4-26b-uncensored-gguf-v2:Q4_K_M`):
+On the hybrid path the pipeline ships (`LLM_BACKEND=venice`), time-to-first-audio
+breaks down, over 20 replayed conversational turns, as:
 
 ```
-TTFT            318.6 ms
-first sentence  976.9 ms   <- gates audio
-decode           16.1 tok/s
+STT                   74 ms median
+LLM first sentence  1011 ms median      <- 84% of the critical path
+TTS first audio      194 ms median
 ```
 
-TTFT is **not** the metric — TTS is driven per sentence, so nothing is audible until
-the first sentence terminator arrives, which is a function of decode rate. At
-16.1 tok/s a ~25-token sentence costs ~1.5 s.
+and of that LLM figure, **952 ms is time-to-first-token** — queueing and prefill,
+not decoding. Decode is 106 chunks/s and produces the rest of the first sentence
+in ~60 ms.
 
-Research 2026-07-30: `Qwen3.6-35B-A3B` (MoE, 3B active) measured at **61.2 tok/s** on
-M1 Max vs 16.7 tok/s for a dense 27B. ~3.7x would put first-sentence near 400 ms.
+## It is a floor, not a model choice
 
-Candidates verified live on ollama.com (HTTP 200, fake tag control returns 404):
+Ten Venice models, four prompts each, same client and network:
 
-| Tag | Size | Note |
+| model | TTFT | first sentence |
 |---|---|---|
-| `huihui_ai/Qwen3.6-abliterated` | 17 GB | best on *both* KL drift (0.0074) and refusal removal (98.5% ASR) per the independent Abliterlitics run; same footprint as today |
-| `tinyrick/Qwen3.6-35B-A3B-uncensored-heretic-vision-llmfan46:Q4_K_M` | 22 GB | lowest KL (0.0037), adds vision; tighter on 32 GB |
-| `HammerAI/gemma-4-26b-a4b-heretic` | 17 GB | low-risk, same base family as current |
+| nvidia-nemotron-3-nano-30b-a3b | 880 ms | 917 ms |
+| venice-uncensored-role-play | 888 ms | 944 ms |
+| **venice-uncensored** (ours) | 851 ms | 971 ms |
+| venice-uncensored-1-2 | 885 ms | 978 ms |
+| mistral-small-3-2-24b-instruct | 912 ms | 1094 ms |
+| gemma-4-uncensored | 1014 ms | 1103 ms |
+| qwen3-235b-a22b-instruct-2507 | 928 ms | 1460 ms |
+| llama-3.3-70b | 1014 ms | 1491 ms |
+| e2ee-gemma-4-26b-a4b-uncensored-p | 1112 ms | 1573 ms |
 
-Rejected: `fredrezones55/...HauhauCS-Aggressive` — 6.5x Heretic's KL drift and built on
-a tool plagiarised from Heretic (AGPL violation confirmed by Heretic's author).
+Every model lands in an 850–1100 ms TTFT band regardless of size, from a 30B-A3B
+MoE to a 405B. A 3B-active model is not faster to first token than a 235B one,
+which is the tell that this is gateway and queueing time rather than compute.
 
-## Update 2026-07-30 — the premise above is wrong; it's the runtime, not the model
+It is not the network either, and not connection setup:
 
-**The current model is already a 4B-active MoE.** From its own GGUF metadata:
-`gemma4.expert_count = 128`, `gemma4.expert_used_count = 8`, 30 blocks, and
-`ollama ps` reports `100% GPU` at 19 GB. A sparse MoE decoding at 12–16 tok/s is
-dense-27B speed. So "swap to a sparse MoE" cannot be the fix — we already have one.
+```
+raw TCP connect to api.venice.ai      39 ms
+raw TLS handshake                     65 ms
+TTFT on a brand-new connection       869 ms
+TTFT on a warm reused connection     881 ms
+TTFT after 12 s idle, expiry 5 s     925 ms
+TTFT after 12 s idle, expiry 300 s   902 ms
+```
 
-**The likely cause is that our model is a GGUF, so Ollama routes it to
-llama.cpp.** This machine's Homebrew Ollama ships an MLX runner
-(`/opt/homebrew/Cellar/ollama/0.21.2_1/libexec/lib/ollama/mlx_metal_v3/libmlxc.dylib`)
-that only MLX-format models can reach. Also relevant: we run **0.21.2, latest is
-0.32.5**, and v0.31.1 shipped "Tightened Gemma 4 MoE model loading in the MLX
-engine" plus a new small-batch matmul kernel — both aimed squarely at our case.
+Connection reuse buys nothing — httpx's default 5 s keepalive expiry looked like
+an obvious win and measured as noise. ~810 ms of the 850 is Venice-side.
 
-**Control experiment (run, conclusive).** Same model class, same runtime, a
-different GGUF changes nothing:
+Prompt size is the one lever that does move it, and only slightly: 849 ms with no
+history, 978 ms at 4 turns, 1022 ms at 8. `HISTORY_MAX_TURNS=8` therefore costs
+about 173 ms. It is deliberately *not* being cut: 8 turns of memory is a product
+feature and 44 ms (8 -> 4) is not worth half of it.
 
-| Model (both GGUF / llama.cpp) | TTFT | first sentence | decode |
-|---|---|---|---|
-| `0xIbra/supergemma4-26b...:Q4_K_M` (current) | 534 ms | 1864 ms | 12.5 tok/s |
-| `HammerAI/gemma-4-26b-a4b-heretic` | 441 ms | 2013 ms | 13.0 tok/s |
+## What was done instead
 
-Within noise. Both depressed by a concurrent download; a clean re-run is in
-`bench_results.jsonl`. **Swapping GGUF→GGUF is a dead end — do not spend more
-time on it.**
+Since the LLM cannot be made faster, the work moved off the critical path:
 
-### Three errors in the research above, caught before they cost anything
-Consistent with `learning.md` "verify subagent research findings before acting":
+- **`issues/0010`** cut TTS first-audio by shortening the model's opening
+  sentence — 481 ms projected to 268 ms.
+- **Speculative dispatch** starts STT and the LLM call during Silero's
+  end-of-speech window, removing a median 342 ms from the measured wait.
+- **`issues/0009`/`0002`** overlapped decode and synthesis with playback.
 
-1. `huihui_ai/Qwen3.6-abliterated` **has no `latest` tag** — the pull command in
-   this issue fails with `pull model manifest: file does not exist`. The "HTTP
-   200 verified" check hit the model *page*, not a pullable manifest.
-2. Its "17 GB" is wrong: every `35b*` tag is **23.94 GB**. On this 32 GB machine
-   (default `iogpu.wired_limit_mb=0` → ~24 GiB) that spills past the GPU wired
-   limit once KV cache and the MLX audio models are resident — it would have been
-   **slower**, not faster.
-3. The 17 GB figure matches the `27b` tag (17.42 GB), which is **dense** (no
-   `-a3b`) and so defeats the entire premise.
+Net: 1,699 ms median first-audio to 1,112 ms, without the LLM getting any faster.
 
-### Result: MLX via mlx-lm is also not the answer
+## What is left
 
-`mlx-community/gemma-4-26B-A4B-it-heretic-4bit`, clean run with Ollama unloaded
-(it OOMs the GPU otherwise — `kIOGPUCommandBufferCallbackErrorOutOfMemory`):
+Only two things would actually move the remaining ~950 ms, and both are choices
+rather than fixes:
 
-| | GGUF / llama.cpp (current) | MLX / mlx-lm |
-|---|---|---|
-| decode | 15.2 tok/s | **18.3 tok/s** (+20%) |
-| TTFT | **276 ms** | 529–1077 ms (2–4× worse) |
-| prompt processing | (fast) | **51–60 tok/s — catastrophic** |
+1. **A local LLM with a warm KV cache** has no gateway in front of it. The
+   earlier local measurements are not encouraging (first sentence ~1.0–1.3 s at
+   14–16 tok/s) but they were taken before any of this year's work, and a small
+   local model used *only* for the opening clause — with the hosted model taking
+   over from sentence two — would hide the entire hosted TTFT. That is a real
+   design, not a tweak.
+2. **Ask Venice** whether the 850 ms floor is expected for this account/region.
+   It is uniform across model sizes, which usually means routing rather than
+   inference, and it may simply be answerable.
 
-Decode is genuinely ~20% faster, and that is the only thing that improved. It
-does not come close to the 3.7× this issue projected, and it is bought at the
-price of prompt processing so slow it disqualifies the runtime for this
-pipeline: with `HISTORY_MAX_TURNS=8` the prompt grows every turn, so at ~55
-tok/s prefill the cost climbs *as the conversation goes on*. That is the
-opposite of what a voice agent needs. Verified on a 17-token prompt, warm, 3
-trials — this is inherent to mlx-lm's prefill, not a cold-start artifact.
+Neither is urgent. The published latency claim is met without them.
 
-**Also disqualifying, independent of speed:** this model opens a
-`<|channel>thought` block on every single generation, even for a bare "Hi" with
-no system prompt. Its chat template suppresses thinking correctly (with thinking
-off it pre-fills an empty closed `<|channel>thought\n<channel|>`) and the model
-ignores it — the heretic ablation appears to have damaged that behaviour. There
-is no `think: false` equivalent in mlx-lm to force it. See gotcha 1 in
-CLAUDE.md; a voice agent cannot ship this.
+## Do not
 
-Two false leads worth not repeating: the first MLX run was invalid because
-`apply_chat_template(tokenize=False)` + `stream_generate(str)` double-prepends
-BOS — pass token ids. And Ollama must be unloaded (`ollama stop <model>`) before
-any MLX bench, or it OOMs at 19 GB resident.
-
-### Verdict on this issue
-
-Both tested levers are dead: **GGUF→GGUF swapping (no change) and MLX via mlx-lm
-(20% decode, ruined prefill)**. The one untested lever left is upgrading Ollama
-itself — 0.21.2 → 0.32.5, whose own MLX engine is a different animal from raw
-mlx-lm (custom small-batch matmul kernels, prefill snapshots, and v0.31.1's
-"Tightened Gemma 4 MoE model loading in the MLX engine"). It may well not repeat
-mlx-lm's prefill weakness. But it replaces the engine the whole agent depends on
-and is not the "one env var" revert this issue assumed, so it needs Sid's call.
-
-Recommendation: **do not spend more on this issue right now.** The measured
-ceiling from a runtime change looks like ~20% of one stage. `issues/0002`
-(inter-sentence gap) and `issues/0001` (barge-in) are smaller wins that are
-certain, and they are what make the agent *feel* natural.
-
-### Where this now pointed
-Test the same model family through the **MLX runtime** —
-`mlx-community/gemma-4-26B-A4B-it-heretic-4bit` (15.6 GB). `mlx_lm` 0.31.3 is
-already installed via `mlx-audio`, so this needs no dependency change.
-`scripts/bench_llm_mlx.py` measures it with metrics identical to `bench_stack.py`.
-
-Caveat for whoever picks this up: if MLX wins, the fix is a **runtime change**,
-not the "one env var" swap step 5 promises. That is a bigger blast radius than
-this issue was scoped for and needs Sid's call before touching `voice_agent.py`.
-
-## Approach
-
-1. `ollama pull huihui_ai/Qwen3.6-abliterated` and A/B with
-   `bench_stack.py --slot llm --llm <a> --llm <b>`, holding `think: false` constant.
-2. Measure first-sentence latency and decode rate, not TTFT.
-3. **Do not enable MTP / speculative decoding** — a net loss on Metal: baseline
-   Qwen3.5-9B 25.3 tok/s drops to 19.3, and Qwen3.6-35B self-MTP collapses to
-   1.93 tok/s (llama.cpp issues #23752, #23011).
-4. Worth testing MLX vs Ollama for the same model: MLX is 20-30% faster on decode,
-   which is the gate here, though Ollama/llama.cpp holds the TTFT crown. Note this
-   machine runs Ollama 0.21.2; newer releases added an MLX backend (~2x decode) and
-   fixed an MLX memory leak, so a runtime upgrade may beat a model swap.
-5. Reversible: one env var / `LLM_MODEL` change.
+Re-open this as a model swap. It has been tested across nine alternatives and
+the spread in TTFT is 260 ms, most of which is paid back in longer first
+sentences. Swapping models also costs the uncensored positioning, which is the
+product.

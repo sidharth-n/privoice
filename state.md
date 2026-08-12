@@ -8,55 +8,55 @@ public launch. Earlier handoffs are in `state-log.md`.
 
 ## Now
 
+**Latency work is done and the 1.3 s claim is met.** 20 turns through the real
+turn-taking loop: **1,112 ms median / 1,463 ms p90** to first audio, down from
+1,699 / 2,757. 13 of 20 turns under 1,300 ms. Nothing got a faster model — see
+the handoff below.
+
+**Still needs a real mic session from Sid.** Every after-number comes from
+`say`-synthesized speech through `scripts/replay_conversation.py`: no room
+noise, no echo path for AEC, one voice. It is a floor, not a promise, and
+barge-in in particular (`issues/0001`) cannot be judged from it.
+
+```bash
+cd ~/Developer/Personal/privoice && LLM_BACKEND=venice uv run python voice_agent.py
+uv run python scripts/analyze_turns.py     # after talking to it
+```
+
+**Still open from the launch:** rotate the Venice API key (below), and the
+Telegram/WhatsApp messages to Erik are sent.
+
+---
+
+## Previous context
+
 Branch `main`, clean, pushed. **The repo is public**:
-https://github.com/sidharth-n/privoice — description and topics set.
-
-The launch is assembled and waiting on Sid, not on code:
-
-- **Launch video is rendered and approved** — `Work/video-engine/apps/privoice/
-  video/out/privoice-9x16.mp4` (primary, for X) and `privoice-16x9.mp4`. 40.4s,
-  Venice palette, dark bed, SFX, Kokoro narration.
-- **X post is drafted, not posted.** Three variants under 280 chars; final copy
-  in the conversation. Attach the 9:16 file, tag `@AskVenice` mid-sentence, and
-  put the demo disclosure in a reply-tweet.
-- **Telegram to Venice is blocked** on one question: Sid asked to "send Erika",
-  but there is no thread or message history with that name in his Telegram (only
-  `@erikabot`, `@IN999ErikaBot`, `@Erika6`, `@ErikaM`, none ever messaged). Best
-  guess is **Erik Voorhees**, Venice's founder. Do not guess a handle — ask.
-
-Last verified: repo visibility, description and topics read back from `gh`; git
-history scanned for the Venice key and secret-shaped strings before going public
-(clean — only `.env.example`, and the two tracked `.jsonl` files contain just the
-synthetic benchmark prompt); `voice_agent`/`engines`/`turnlog` all import cleanly
-after the directory move.
+https://github.com/sidharth-n/privoice. The launch shipped: X post is out, and
+the messages to Erik went via Telegram and WhatsApp. The launch video lives at
+`Work/video-engine/apps/privoice/video/out/privoice-9x16.mp4`.
 
 ## Next
 
-1. **Post to X** with `privoice-9x16.mp4`, then the disclosure reply.
-2. **Get the Telegram handle** for Erik/Erika and send the repo + video +
-   benchmark writeup.
-3. **Fix the TTS proper-noun bug** — deliberately deferred by Sid until after
-   the post, but it is the first thing a cloner will hit. `engines.py`'s
-   `KokoroTts` uses `kokoro_mlx` 0.1.1, whose misaki G2P is built with **no
-   espeak fallback**, so any out-of-lexicon word (including "Privoice" and the
-   user's own name) phonemizes to `❓` and is synthesized as *silence*. Fix is to
-   drive `mlx_audio.tts.models.kokoro.KokoroPipeline`, which constructs
-   `EspeakFallback` itself. Working reference implementation already exists:
-   `Work/video-engine/apps/privoice/video/scripts/generate-vo-kokoro.py`. Needs
-   an issue filed alongside `issues/0007`.
-4. **Rotate the Venice API key** — pasted into a chat transcript during
-   development, and the repo is now public (the key was never committed, but
-   rotate anyway).
-5. `issues/0010` — prompt for a short first sentence. A `SYSTEM_PROMPT` line, no
-   code; worth several hundred ms on the measured ~8 ms/char.
-6. `issues/0009` — drain the LLM stream concurrently with playback, then
-   `issues/0002`.
-7. Conversational runs for all-local and all-hosted, so the local-vs-hosted
+1. **Talk to it.** Everything below was verified headlessly; a real mic session
+   is the only thing that can confirm the latency numbers hold with a human
+   voice in a real room, and the only way to judge barge-in.
+2. **Rotate the Venice API key** — pasted into a chat transcript during
+   development, and the repo is public. The key was never committed; rotate
+   anyway. Only Sid can do this.
+3. `issues/0001` — barge-in. Now the only urgent issue, and the last part of the
+   turn-taking path never properly measured. It was waiting on `0002`, which has
+   landed, and it finally has a rig: `replay_conversation.py` can script
+   overlapping speech instead of requiring it to be performed. Note its two
+   symptoms are opposite failures and one threshold cannot fix both.
+4. Conversational runs for all-local and all-hosted, so the local-vs-hosted
    comparison rests on the same kind of data the hybrid number now does.
+   `replay_conversation.py` makes this cheap — it did not exist before.
+5. `issues/0007` — proper nouns the recognizer cannot hear. The STT twin of the
+   TTS bug fixed as `0011`, and the harder half.
 
 ## Blockers
 
-- **Telegram recipient unknown** (see Now). Everything else is unblocked.
+- None.
 
 ## Known-soft claims
 
@@ -64,11 +64,14 @@ after the directory move.
   call, not a verified claim. Local voice assistants are a crowded genre; at
   least one markets itself as uncensored while routing TTS through ElevenLabs.
   Flagged to him; he chose to keep it.
-- **The X post quotes 2.4–3s local → 1.3s hosted.** Neither figure is in
-  `docs/BENCHMARK.md`: our recorded all-local numbers are 1,642 ms warm and
-  7,824 ms cold, and the hosted-path conversational number is 1,699 ms median /
-  1,497 ms warm, with the best turns at 1.1–1.3s. Raised twice; Sid chose it.
-  If the numbers are challenged publicly, the repo is the source of truth.
+- **The X post quotes 2.4–3s local → 1.3s hosted.** ~~Neither figure is in
+  `docs/BENCHMARK.md`.~~ **Resolved 2026-08-12:** the hosted figure is now true.
+  The conversational number is **1,112 ms median / 1,463 ms p90**, so 1.3 s is
+  if anything conservative, and `docs/BENCHMARK.md` shows the work. Two caveats
+  stand: the after-figures are `say`-synthesized speech through the real loop,
+  not a mic in a room, and the **local** side of the comparison has still never
+  been measured conversationally — the 2.4–3 s figure remains unsourced. If the
+  numbers are challenged publicly, the repo is the source of truth.
 - The cold-open reply in the video is a **scripted line**, not live model output.
   The `DEMO · SCRIPTED REPLY` stamp was removed at Sid's request; the disclosure
   now depends on him posting it in the reply-tweet.
@@ -77,48 +80,64 @@ after the directory move.
 - All numbers come from one machine, one network, one city, one day. Nothing
   measures output quality.
 
-## Latest handoff — 2026-08-12 (Privoice launch prep)
+## Latest handoff — 2026-08-12 (latency: 1,699 ms -> 1,112 ms)
 
-**Shipped this session, in order:**
+Sid's brief: the launch says 1.3 s, so the repo has to actually be 1.3-1.5 s.
+It is. 20 turns through the real loop measure **1,112 ms median / 1,463 ms p90**
+to first audio, 13 of 20 under 1,300 ms.
 
-1. **Renamed the project.** `venice-voice-agent` → `privoice`: GitHub repo via
-   `gh repo rename` (old URL redirects), local directory moved, every internal
-   reference rewritten, `uv.lock` regenerated so the package name follows.
-   Display casing is "Privoice" in prose, `privoice` for repo/dir/package.
-   External references in `Work/video-engine/apps/privoice` repointed too — its
-   VO generator had the agent path hardcoded. Registered in the brain as a **new**
-   card (`brain/projects/privoice.md`), not a rename: `uncensored-local-voice`
-   still exists as its own project.
+**The thing worth remembering: no model got faster.** The LLM was 63% of the
+budget and turned out to be a floor — nine Venice models from 30B-A3B to 405B
+all return their first token in 850-1,100 ms, raw RTT is 39 ms, and HTTP
+connection reuse (an obvious suspect: httpx expires keepalives after 5 s, and
+turns are further apart than that) measured as pure noise. Every millisecond won
+came from changing the workload instead. `issues/0003` is rewritten around this
+and says plainly: do not re-open it as a model swap.
 
-2. **Made the repo public** after scanning history for secrets (clean), with
-   description and topics. README rewritten to lead with the product and a
-   runnable quick-start, measurement intact underneath.
+**What shipped, in dependency order:**
 
-3. **Built the launch video** as a new `video-engine` tenant
-   (`Work/video-engine/apps/privoice/`, brief `0001-launch.md`). Six scenes:
-   recorded cold-open exchange → wordmark → spec checklist → terminal with real
-   `turn_log.jsonl` rows → three claims that erase themselves → repo + Venice
-   lockup. Palette scraped from live venice.ai markup. Music bed picked by
-   measurement (spectral centroid, BPM, beat-autocorrelation "pulse") across 32
-   candidates; `mixkit-609` chosen. Per-bed `BGM_GAIN`, because a sub-heavy bed
-   and a mid-bright one cannot share one number.
+1. **`0011` (new, closed) — TTS was deleting words, not mispronouncing them.**
+   `kokoro_mlx` 0.1.1 builds misaki's G2P with no espeak fallback, so anything
+   outside Kokoro's lexicon phonemizes to `''` and synthesizes as silence. "Say
+   Privoice now.", "Say Sid now." and "Say Kokoro now." all produced *exactly*
+   33,600 samples — the same as "Say now." Now drives mlx_audio's
+   `KokoroPipeline`; TTFA unchanged. The old path is `TTS_ENGINE=kokoro-legacy`.
+   Missing espeak is now a **startup error**, not a logging warning nobody sees.
+2. **`0009` (closed)** — LlmStreamer drains tokens on its own thread. Decode
+   rate on multi-sentence replies 5.8 -> 106 chunks/s.
+3. **`0002` (closed)** — playback moved to its own thread, synthesis runs up to
+   2 sentences ahead. Gap heard between sentences 293 ms -> 0 ms.
+4. **`0010` (closed)** — the prompt is a latency control. "Your FIRST sentence
+   must be under 8 words" took the opener from 46 to 19 chars median, p90 from
+   108 to 31. Only affordable because (3) made later sentences free.
+5. **Speculative dispatch** — STT and the LLM start 200 ms into Silero's 500 ms
+   end-of-speech window. Median 342 ms recovered, 20/20 turns. `SPECULATE=0`
+   restores the old path exactly.
+6. **`0008` (closed)** — `os._exit(0)` after cleanup, as the issue itself
+   recommended.
 
-4. **Found and worked around a real TTS defect** (see Next #3) — the most
-   reusable finding of the session; written up in `learning.md`.
+**The most useful thing built is not a fix.** `run_conversation()` now takes its
+frames from an iterator, so `scripts/replay_conversation.py` can drive the whole
+turn-taking loop off `say`-generated speech. That loop had never been runnable
+without a microphone. It immediately found that **speculative dispatch was a
+complete no-op**: silero clears `temp_end` both when speech resumes *and* when
+it emits `end`, so every guess was discarded one frame before the commit that
+would have used it. The code read as correct. Three lessons in `learning.md`.
 
-**Decisions that will look arbitrary later:**
+**Two things I did not do, deliberately:**
 
-- `"Pre-voice"` in the VO script is a **pronunciation control, not a typo**.
-  espeak maps the real spelling to `pɹˈɪvYs` ("PRIV-oyss"), which Sid heard as
-  "prevaice"; the hyphenated form maps to `pɹˌivˈYs` ("pree-VOICE"). Do not
-  "correct" it.
-- The silence between question and reply in the video's cold open is **38 frames
-  = 1,272 ms**, a real measured turn, with a counter running through it. Cutting
-  it shorter would have been trivial and would have been the one lie the film
-  argues against.
-- Every number in the video's terminal scene is a real row from
-  `turn_log.jsonl`, per video-engine's honest-content rule.
+- **`issues/0001` (barge-in)** — needs double-talk with a real mic and an echo
+  path. Left urgent. The replay harness now makes it testable.
+- **`issues/0004`** — chased every hypothesis and the 5-10x slowdown does not
+  reproduce: STT is 48-90 ms isolated *and* under the full real-loop load, which
+  was the fastest configuration of the five I built. Dropped to low with the
+  measurements written down, rather than inventing a fix for it.
 
-**Start next session by** asking whether the post went out and who the Telegram
-recipient is. If the launch is done, Next #3 (the TTS bug) is the highest-value
-code work and has a working reference implementation to copy.
+**Watch out for:** the after-numbers are `say`-synthesized speech — no room
+noise, no echo path, one voice. Labelled as a floor everywhere they appear.
+`first_audio_ms` also still starts when silero *reports* end-of-speech, which is
+500 ms after the user stopped; speculation spends that window rather than
+shortening it, so felt latency is better too, but the two are not the same
+number and `CLAUDE.md` gotcha #10 says so.
+
+**Start next session by** asking Sid how it felt on a real mic, then `0001`.

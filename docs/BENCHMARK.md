@@ -247,8 +247,64 @@ The ranking is unchanged: hybrid is still the configuration to ship, the hosted
 LLM still carries its weight, and local STT/TTS are still far cheaper than a
 round trip. What changes is the **headline number**. `1,381 ms` is a real
 measurement of a synthetic workload and should be quoted as one. The number to
-quote for a conversation is **~1.7 s median, ~2.8 s p90**, or ~1.5 s once the
-local slots are warm.
+quote for a conversation was **~1.7 s median, ~2.8 s p90** — until the findings
+above were acted on, below.
+
+## Acting on it: 1,699 ms → 1,112 ms (2026-08-12)
+
+Every finding in the previous section was a defect, and all four were fixed the
+same day. 20 turns driven through the real turn-taking loop by
+`scripts/replay_conversation.py`, hybrid config, same machine and network:
+
+| stage | before (34 live turns) | after (20 replayed turns) |
+|---|---|---|
+| STT | 269 ms | 74 ms |
+| LLM first sentence | 1,076 ms | 1,011 ms |
+| TTS first audio | 388 ms | 194 ms |
+| work done before the clock starts | — | −342 ms |
+| **→ first audio** | **1,699 ms** | **1,112 ms** |
+| p90 | 2,757 ms | 1,463 ms |
+| gap heard between sentences | 293 ms | 0 ms |
+| decode rate, multi-sentence replies | 5.8 chunks/s | 106 chunks/s |
+
+**No model got faster.** The LLM is a floor: nine Venice models measured
+850–1,100 ms to first token regardless of size (30B-A3B through 405B), against a
+39 ms round trip, and HTTP connection reuse measured as noise. `issues/0003`
+carries the table. What moved instead:
+
+1. **The prompt** (`issues/0010`). Time-to-first-audio scales at ~7.9 ms per
+   character of the reply's first sentence, so the opener is a latency control.
+   Naming it explicitly — "your FIRST sentence must be under 8 words" — took the
+   median opener from 46 characters to 19 and the p90 from 108 to 31. That p90
+   was what produced the pipeline's 2,757 ms p90.
+2. **Overlapping decode with playback** (`issues/0009`). Tokens were pulled
+   lazily through a blocking playback call, so sentence two's tokens were not
+   requested until sentence one had finished being spoken.
+3. **Overlapping synthesis with playback** (`issues/0002`). Device writes moved
+   to their own thread, so synthesis runs up to two sentences ahead.
+4. **Speculative dispatch.** Silero reports end-of-speech only after
+   `VAD_MIN_SILENCE_MS` of silence has already elapsed. That window was dead
+   time the user was already waiting through — and it does not even appear in
+   `first_audio_ms`, which starts when Silero *reports* the end. STT and the
+   model's first token now run inside it, and the guess is discarded if the user
+   turns out to have only paused. Median 342 ms recovered, on 20 of 20 turns.
+
+### Limits of the after-figures
+
+These are not equivalent to the 34-turn session above and should not be pooled
+with it.
+
+- The speech is `say`-synthesized, not a person in a room: no background noise,
+  no echo path for AEC to cancel, one voice, consistent level. **This is a floor,
+  not a promise.**
+- 20 turns across two runs. One run showed five turns with STT at 390–528 ms and
+  the other showed none; that variance is machine state, not the pipeline
+  (`issues/0004`), but it is real and it is not in the median.
+- One turn hit a 7.4 s Venice stall. It is in the max, not the median, and
+  hosted tail latency is a real property of the hosted path.
+- The felt wait is still `VAD_MIN_SILENCE_MS` longer than the logged number,
+  because the clock starts when Silero reports the end and not when the user
+  stopped talking. Speculation spends that window rather than shortening it.
 
 ## What this means if you are building a voice agent
 
@@ -271,6 +327,16 @@ local slots are warm.
 6. **Report the warm-up, not just the steady state.** The local slots took
    ~15 turns to reach their best numbers, long after model loading was done.
    A five-turn sample would have described a system nobody experiences for long.
+7. **Spend the end-of-turn silence.** Every VAD has a timeout before it will
+   declare an utterance over — 500 ms here — and that time is pure waiting.
+   Starting transcription and generation inside it, then discarding the result
+   if the user resumes, was worth 342 ms a turn: more than any slot swap
+   measured in this document, at the cost of an occasional wasted API call.
+8. **Check whether your bottleneck has a floor before optimising it.** The LLM
+   was 63% of the budget and none of it was winnable: every model tested
+   returned its first token in the same 850–1,100 ms band. Everything that
+   worked changed the *workload* instead — a shorter opening sentence, work
+   moved off the critical path, work started earlier.
 
 ## Reproducing this
 
