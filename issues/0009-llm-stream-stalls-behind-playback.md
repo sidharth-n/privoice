@@ -28,8 +28,8 @@ gap before sentence two to TTS synthesizing synchronously. But at the instant
 sentence one stops playing, sentence two's *tokens* have not been requested
 either — so the gap is LLM round-trip plus TTS synthesis, not TTS alone.
 Pre-synthesizing audio without also draining the LLM concurrently will only
-close part of it. Measured gap before later sentences: **376 ms median** over
-9 sentences.
+close part of it. Measured gap before later sentences: **293 ms median** over
+12 sentences.
 
 **Measurement:** `llm_chunk_s` and `llm_total_ms` in `turn_log.jsonl` are only
 meaningful on single-sentence turns. On multi-sentence turns they measure the
@@ -37,16 +37,16 @@ rate of speech, not the rate of the model, and understate it by ~24×.
 
 ## Evidence
 
-16-turn hybrid conversation, 2026-08-12, split by reply shape:
+34-turn hybrid conversation, 2026-08-12, split by reply shape:
 
 | Reply | Measured decode rate | n |
 |---|---|---|
-| Single sentence (drained before playback starts) | **110 chunks/s** | 7 |
-| Two or more sentences (drained between sentences) | **4.8 chunks/s** | 9 |
+| Single sentence (drained before playback starts) | **122 chunks/s** | 19 |
+| Two or more sentences (drained between sentences) | **5.8 chunks/s** | 12 |
 
-110 chunks/s agrees with the 115 tok/s that `scripts/bench_stack.py` measured
+122 chunks/s agrees with the 115 tok/s that `scripts/bench_stack.py` measured
 for `venice-uncensored` with no playback in the loop, which is what confirms
-the 4.8 figure is backpressure rather than the model.
+the 5.8 figure is backpressure rather than the model.
 
 Reproduce: `uv run python scripts/analyze_turns.py` after any conversation with
 multi-sentence replies; compare the decode rate against `bench_stack.py --slot llm`.

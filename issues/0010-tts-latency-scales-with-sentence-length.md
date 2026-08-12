@@ -32,15 +32,15 @@ more than switching substrate does.
 
 ## Evidence
 
-16 turns, hybrid config, 2026-08-12. Time-to-first-audio against character
+34 turns, hybrid config, 2026-08-12. Time-to-first-audio against character
 count of the first sentence:
 
 ```
-tts_first_ms ≈ 101 ms + 9.1 ms per character      (R² = 0.94, n = 15)
+tts_first_ms ≈ 118 ms + 7.9 ms per character      (R² = 0.86, n = 30)
 ```
 
 One turn sat far off the line at 3,776 ms and is excluded; including it the fit
-is 13.3 ms/char at R² = 0.52. That outlier is unexplained and may be a separate
+is 11.0 ms/char at R² = 0.50. That outlier is unexplained and may be a separate
 contention problem — worth a look before assuming the model is clean.
 
 The near-linear fit with a small intercept is itself the finding: there is no
@@ -57,7 +57,7 @@ Cheapest first, and the first one may be enough:
 
 1. **Prompt for a short opener.** Add a line to `SYSTEM_PROMPT` asking the
    first sentence of every reply to be brief. Costs nothing, changes no code,
-   and on these numbers a 40-character opener instead of 120 saves ~700 ms.
+   and on these numbers a 40-character opener instead of 120 saves ~630 ms.
    Verify with `scripts/analyze_turns.py` before and after rather than by ear.
 2. **Split the first sentence further for synthesis** — synthesize the first
    clause, start playing, synthesize the rest underneath. Prosody across the

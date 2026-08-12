@@ -5,9 +5,29 @@ how the project gets smarter rather than repeating itself.
 
 ---
 
+## 2026-08-12 · Snapshot the dataset before you publish statistics from it
+
+**Context:** The first conversational write-up quoted 2,143 ms median from 16 turns.
+The agent was still running in the background and the log kept growing; by the time
+the session ended it held 34 turns and the true median was 1,699 ms. The published
+correction ("the synthetic figure is 1.55× optimistic") was itself wrong by a third —
+it was 1.23× — and had already gone into the README, `CLAUDE.md`, two issues and
+`learning.md` before anyone noticed.
+
+**Rule:** If a data source can still be appended to, copy it to a fixed path and
+compute, cite and re-verify every figure from that copy. Note the sample size next to
+every statistic so a stale number is visibly stale. And before publishing, check
+whether the source grew while the analysis was being written.
+
+**Example:** The drift was not noise — the local slots warm up over ~15 turns, so the
+early sample was systematically slow. A half-session sample was measuring a transient
+and reporting it as the steady state, which is a worse error than the arithmetic one.
+
+---
+
 ## 2026-08-12 · Measuring a producer through a lazy consumer measures the consumer
 
-**Context:** The new per-turn log reported the hosted LLM decoding at 4.8 chunks/s —
+**Context:** The new per-turn log reported the hosted LLM decoding at 5.8 chunks/s —
 24× worse than the 115 tok/s `bench_stack.py` measured for the same model minutes
 earlier. Nothing had changed on Venice's side. Tokens are pulled lazily through
 `sentence_stream`, and `speak_sentence()` blocks for the whole duration of playback,
@@ -18,8 +38,8 @@ rate" was the rate of speech.
 whether it ever stops pulling. A generator's timing reflects the slowest thing in the
 consumption chain, not the producer. Splitting the sample by a structural property of
 the consumer — here, one-sentence vs multi-sentence replies — separates the two in one
-step: single-sentence replies drained before playback began and reported 110 chunks/s,
-matching the isolated benchmark and proving the 4.8 was backpressure.
+step: single-sentence replies drained before playback began and reported 122 chunks/s,
+matching the isolated benchmark and proving the 5.8 was backpressure.
 
 **Example:** The artifact was also a real defect. `issues/0002` blamed the gap before
 sentence two on synchronous TTS; the log showed sentence two's *tokens* had not been
@@ -31,12 +51,12 @@ requested either. Filed as `issues/0009`, and it has to land before `0002` or fi
 ## 2026-08-12 · Per-slot benchmarks cannot see the effects that dominate a real turn
 
 **Context:** `bench_stack.py` timed each slot in isolation against one fixed short
-prompt and produced the headline 1,381 ms hybrid figure. Sixteen turns of actual
-conversation measured 2,143 ms median / 3,007 ms p90 — and the three biggest
-contributors were all invisible to the per-slot harness: STT costing 106 ms per second
-of speech in-pipeline vs ~29 ms/s isolated, TTS time-to-first-audio scaling at ~9 ms
-per character of the reply's first sentence (R²=0.94), and the LLM stalling behind
-playback.
+prompt and produced the headline 1,381 ms hybrid figure. Thirty-four turns of actual
+conversation measured 1,699 ms median / 2,757 ms p90 — and the biggest contributors
+were all invisible to the per-slot harness: STT costing 89 ms per second of speech
+in-pipeline vs ~29 ms/s isolated, TTS time-to-first-audio scaling at ~8 ms per
+character of the reply's first sentence (R²=0.86), the LLM stalling behind playback,
+and the local slots taking ~15 turns to warm up long after model loading finished.
 
 **Rule:** A benchmark that holds the workload fixed measures the slot, not the system.
 If the deliverable is a latency claim about a *pipeline*, instrument the live path and

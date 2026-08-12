@@ -14,15 +14,20 @@ to `turn_log.jsonl` (`turnlog.py`); `scripts/analyze_turns.py` reports medians
 and p90 per stage grouped by config; `scripts/smoke_turnlog.py` is the
 multi-turn regression test for the path.
 
-16 real conversational turns on hybrid: **2,143 ms median / 3,007 ms p90** to
+34 real conversational turns on hybrid: **1,699 ms median / 2,757 ms p90** to
 first audio, against the 1,381 ms the per-slot benchmark predicted. Ranking
-unchanged, magnitude 1.55× optimistic. Three findings, all invisible to
+unchanged, magnitude 1.23× optimistic. Four findings, all invisible to
 `bench_stack.py`:
 
-- STT costs **106 ms per second of speech** in-pipeline vs ~29 ms/s isolated
-  (`issues/0004`, now with real numbers).
-- TTS time-to-first-audio ≈ **101 ms + 9.1 ms per character** of the reply's
-  first sentence, R²=0.94 — so the model's opening phrase is the biggest
+- **The local slots warm up over ~15 turns** — STT 382→178 ms, TTS 546→303 ms,
+  first-audio 2,196→1,497 ms — while the hosted LLM is flat to within 2%. This
+  is well after model loading finishes and is unexplained. It also means any
+  short sample (including the 16-turn one this section originally reported)
+  overstates the latency.
+- STT costs **89 ms per second of speech** in-pipeline (103 ms/s before it
+  warms) vs ~29 ms/s isolated (`issues/0004`, now with real numbers).
+- TTS time-to-first-audio ≈ **118 ms + 7.9 ms per character** of the reply's
+  first sentence, R²=0.86 — so the model's opening phrase is the biggest
   latency lever in the system (`issues/0010`, new).
 - The LLM stream is **not drained during playback**, so sentence two's tokens
   are not even requested until sentence one finishes speaking (`issues/0009`,

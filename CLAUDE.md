@@ -9,11 +9,13 @@ runs either on-device or on Venice's hosted API, selected by env var. Forked
 - *Synthetic, per-slot, 5 samples* (`scripts/bench_stack.py`): all-local
   1,642 ms · all-Venice 3,672 ms · **hybrid 1,381 ms**. Cold start, the
   realistic first turn: local 7,824 ms vs hybrid 1,381 ms.
-- *Real conversation, 16 turns, hybrid* (`turn_log.jsonl`): **2,143 ms median,
-  3,007 ms p90** to first audio. The synthetic figure is 1.55× optimistic —
-  quote it as a per-slot measurement, never as conversational latency.
+- *Real conversation, 34 turns, hybrid* (`turn_log.jsonl`): **1,699 ms median,
+  2,757 ms p90** to first audio; ~1,497 ms once warm. Quote the synthetic
+  figure as a per-slot measurement, never as conversational latency.
 
-The ranking is unchanged (hybrid wins); the magnitude is not.
+The ranking is unchanged (hybrid wins); the magnitude is not. The local slots
+warm up over ~15 turns (STT 382→178 ms, TTS 546→303 ms) while the hosted LLM is
+flat, so a short sample describes a system nobody experiences for long.
 
 The original "<1 s warm" claim from the local build was never met — see
 `issues/0003`. The LLM's **first-sentence** time is the dominant cost, and
