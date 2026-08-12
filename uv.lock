@@ -1340,28 +1340,34 @@ name = "privoice"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "espeakng-loader" },
     { name = "httpx" },
     { name = "kokoro-mlx" },
     { name = "livekit" },
+    { name = "misaki" },
     { name = "mlx" },
     { name = "mlx-audio" },
     { name = "moonshine-voice" },
     { name = "numpy" },
     { name = "onnxruntime" },
+    { name = "phonemizer-fork" },
     { name = "silero-vad" },
     { name = "sounddevice" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "espeakng-loader", specifier = ">=0.2.4" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "kokoro-mlx", specifier = ">=0.1.1" },
     { name = "livekit", specifier = ">=1.1.6" },
+    { name = "misaki", specifier = ">=0.9.4" },
     { name = "mlx", specifier = ">=0.31.2" },
     { name = "mlx-audio", specifier = ">=0.4.6" },
     { name = "moonshine-voice", specifier = ">=0.0.59" },
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "onnxruntime", specifier = ">=1.28.0" },
+    { name = "phonemizer-fork", specifier = ">=3.3.2" },
     { name = "silero-vad", specifier = ">=6.2.1" },
     { name = "sounddevice", specifier = ">=0.5.5" },
 ]

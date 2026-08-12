@@ -3,101 +3,122 @@
 _Last updated: 2026-08-12_
 
 Forked from `uncensored-local-voice` (the fully on-device build) to add hosted
-slots and measure the two against each other. Everything before the fork is in
-`state-log.md`.
+slots and measure the two against each other, then renamed **Privoice** for a
+public launch. Earlier handoffs are in `state-log.md`.
 
 ## Now
 
-**2026-08-12 (later): live turns are now instrumented, and the real numbers
-are worse than the synthetic ones.** Every turn appends a full stage breakdown
-to `turn_log.jsonl` (`turnlog.py`); `scripts/analyze_turns.py` reports medians
-and p90 per stage grouped by config; `scripts/smoke_turnlog.py` is the
-multi-turn regression test for the path.
+Branch `main`, clean, pushed. **The repo is public**:
+https://github.com/sidharth-n/privoice — description and topics set.
 
-34 real conversational turns on hybrid: **1,699 ms median / 2,757 ms p90** to
-first audio, against the 1,381 ms the per-slot benchmark predicted. Ranking
-unchanged, magnitude 1.23× optimistic. Four findings, all invisible to
-`bench_stack.py`:
+The launch is assembled and waiting on Sid, not on code:
 
-- **The local slots warm up over ~15 turns** — STT 382→178 ms, TTS 546→303 ms,
-  first-audio 2,196→1,497 ms — while the hosted LLM is flat to within 2%. This
-  is well after model loading finishes and is unexplained. It also means any
-  short sample (including the 16-turn one this section originally reported)
-  overstates the latency.
-- STT costs **89 ms per second of speech** in-pipeline (103 ms/s before it
-  warms) vs ~29 ms/s isolated (`issues/0004`, now with real numbers).
-- TTS time-to-first-audio ≈ **118 ms + 7.9 ms per character** of the reply's
-  first sentence, R²=0.86 — so the model's opening phrase is the biggest
-  latency lever in the system (`issues/0010`, new).
-- The LLM stream is **not drained during playback**, so sentence two's tokens
-  are not even requested until sentence one finishes speaking (`issues/0009`,
-  new — the larger half of `issues/0002`, and must land first).
+- **Launch video is rendered and approved** — `Work/video-engine/apps/privoice/
+  video/out/privoice-9x16.mp4` (primary, for X) and `privoice-16x9.mp4`. 40.4s,
+  Venice palette, dark bed, SFX, Kokoro narration.
+- **X post is drafted, not posted.** Three variants under 280 chars; final copy
+  in the conversation. Attach the 9:16 file, tag `@AskVenice` mid-sentence, and
+  put the demo disclosure in a reply-tweet.
+- **Telegram to Venice is blocked** on one question: Sid asked to "send Erika",
+  but there is no thread or message history with that name in his Telegram (only
+  `@erikabot`, `@IN999ErikaBot`, `@Erika6`, `@ErikaM`, none ever messaged). Best
+  guess is **Erik Voorhees**, Venice's founder. Do not guess a handle — ask.
 
-Written up in `docs/BENCHMARK.md` → "What a real conversation measures".
-Still outstanding from this: the all-local and all-hosted *conversational*
-runs have not been done, so only the hybrid magnitude is corrected.
-
-## Earlier today
-
-The Venice port is done and measured. Every slot (STT, LLM, TTS) swaps between
-on-device and Venice's hosted API by env var. **The local path is still the
-default and is unchanged** — the port is purely additive, so nothing regressed.
-
-The benchmark is the point of the repo, and it is finished:
-
-| Configuration | Warm | First turn after idle |
-|---|---|---|
-| All local | 1,642 ms | 7,824 ms |
-| All Venice | 3,672 ms | 3,672 ms |
-| Hybrid (local STT/TTS + Venice LLM) | **1,381 ms** | **1,381 ms** |
-
-Headline result: all-hosted is 2.2× slower than the laptop, and the cause is a
-fixed **~400 ms of server-side latency per API request** — isolated on a static
-`GET /models` that needs no auth, survives keep-alive connection reuse, and sits
-behind a 37 ms TCP connect. A voice turn is three sequential calls, so ~1.2 s of
-pure overhead before any token is generated. Cold start reverses the warm
-conclusion: local pays a measured ~7.4 s model load on the first turn after
-idle, hosted pays none.
-
-Venice serves the same Parakeet and Kokoro checkpoints, so STT and TTS are
-controlled comparisons. The LLM row is not — see Known-soft claims.
-
-Last verified: `scripts/bench_stack.py` run end to end on the M5 today against
-both backends, 5 samples per slot; `smoke_pipeline.py` green in all three
-configurations and producing real reply audio.
+Last verified: repo visibility, description and topics read back from `gh`; git
+history scanned for the Venice key and secret-shaped strings before going public
+(clean — only `.env.example`, and the two tracked `.jsonl` files contain just the
+synthetic benchmark prompt); `voice_agent`/`engines`/`turnlog` all import cleanly
+after the directory move.
 
 ## Next
 
-1. **`issues/0010` — prompt for a short first sentence.** A `SYSTEM_PROMPT`
-   line, no code. On the measured 9.1 ms/char it is worth several hundred ms
-   off every reply. Verify with `analyze_turns.py` before/after, not by ear.
-2. **`issues/0009` — drain the LLM stream concurrently with playback.** Then
-   `issues/0002`. Constraints in the issue: barge-in cancel must reach the
-   producer, and no new thread per turn.
-3. **Conversational runs for all-local and all-hosted**, so the local-vs-hosted
+1. **Post to X** with `privoice-9x16.mp4`, then the disclosure reply.
+2. **Get the Telegram handle** for Erik/Erika and send the repo + video +
+   benchmark writeup.
+3. **Fix the TTS proper-noun bug** — deliberately deferred by Sid until after
+   the post, but it is the first thing a cloner will hit. `engines.py`'s
+   `KokoroTts` uses `kokoro_mlx` 0.1.1, whose misaki G2P is built with **no
+   espeak fallback**, so any out-of-lexicon word (including "Privoice" and the
+   user's own name) phonemizes to `❓` and is synthesized as *silence*. Fix is to
+   drive `mlx_audio.tts.models.kokoro.KokoroPipeline`, which constructs
+   `EspeakFallback` itself. Working reference implementation already exists:
+   `Work/video-engine/apps/privoice/video/scripts/generate-vo-kokoro.py`. Needs
+   an issue filed alongside `issues/0007`.
+4. **Rotate the Venice API key** — pasted into a chat transcript during
+   development, and the repo is now public (the key was never committed, but
+   rotate anyway).
+5. `issues/0010` — prompt for a short first sentence. A `SYSTEM_PROMPT` line, no
+   code; worth several hundred ms on the measured ~8 ms/char.
+6. `issues/0009` — drain the LLM stream concurrently with playback, then
+   `issues/0002`.
+7. Conversational runs for all-local and all-hosted, so the local-vs-hosted
    comparison rests on the same kind of data the hybrid number now does.
-4. **Record a demo.** A voice project with no audible artifact is unpersuasive.
-   `out_reply.wav` exists, but a screen recording of a live barge-in turn in
-   hybrid mode is what the README actually needs.
-5. **Rotate the Venice API key** — the one in `.env` was pasted into a chat
-   transcript during development.
-6. Longer-generation benchmark. Every current number uses one short prompt,
-   which structurally favours the slower decoder (local). Longer replies should
-   shift the balance toward Venice; untested.
-4. Concurrency. All measurements are single-client and sequential, so the main
-   advantage of a hosted API is invisible in them.
-5. A streaming/WebSocket path if Venice ever ships one — the per-request tax is
-   what makes REST unusable for continuous voice.
 
 ## Blockers
 
-- None technical. The repo runs in all three configurations.
+- **Telegram recipient unknown** (see Now). Everything else is unblocked.
 
 ## Known-soft claims
 
-- The LLM row is **not** a controlled comparison (local 26B Q4 GGUF vs
-  `venice-uncensored` — different models on different hardware). Stated plainly
-  in both the README and `docs/BENCHMARK.md`; do not let it drift into being
-  quoted as like-for-like.
-- All numbers come from one machine, one network, one city, one day.
-- Nothing here measures output quality. Latency only.
+- **"World's first fully private, uncensored voice agent"** is Sid's positioning
+  call, not a verified claim. Local voice assistants are a crowded genre; at
+  least one markets itself as uncensored while routing TTS through ElevenLabs.
+  Flagged to him; he chose to keep it.
+- **The X post quotes 2.4–3s local → 1.3s hosted.** Neither figure is in
+  `docs/BENCHMARK.md`: our recorded all-local numbers are 1,642 ms warm and
+  7,824 ms cold, and the hosted-path conversational number is 1,699 ms median /
+  1,497 ms warm, with the best turns at 1.1–1.3s. Raised twice; Sid chose it.
+  If the numbers are challenged publicly, the repo is the source of truth.
+- The cold-open reply in the video is a **scripted line**, not live model output.
+  The `DEMO · SCRIPTED REPLY` stamp was removed at Sid's request; the disclosure
+  now depends on him posting it in the reply-tweet.
+- The LLM row of the benchmark is **not** a controlled comparison (local 26B Q4
+  GGUF vs `venice-uncensored`). STT and TTS are.
+- All numbers come from one machine, one network, one city, one day. Nothing
+  measures output quality.
+
+## Latest handoff — 2026-08-12 (Privoice launch prep)
+
+**Shipped this session, in order:**
+
+1. **Renamed the project.** `venice-voice-agent` → `privoice`: GitHub repo via
+   `gh repo rename` (old URL redirects), local directory moved, every internal
+   reference rewritten, `uv.lock` regenerated so the package name follows.
+   Display casing is "Privoice" in prose, `privoice` for repo/dir/package.
+   External references in `Work/video-engine/apps/privoice` repointed too — its
+   VO generator had the agent path hardcoded. Registered in the brain as a **new**
+   card (`brain/projects/privoice.md`), not a rename: `uncensored-local-voice`
+   still exists as its own project.
+
+2. **Made the repo public** after scanning history for secrets (clean), with
+   description and topics. README rewritten to lead with the product and a
+   runnable quick-start, measurement intact underneath.
+
+3. **Built the launch video** as a new `video-engine` tenant
+   (`Work/video-engine/apps/privoice/`, brief `0001-launch.md`). Six scenes:
+   recorded cold-open exchange → wordmark → spec checklist → terminal with real
+   `turn_log.jsonl` rows → three claims that erase themselves → repo + Venice
+   lockup. Palette scraped from live venice.ai markup. Music bed picked by
+   measurement (spectral centroid, BPM, beat-autocorrelation "pulse") across 32
+   candidates; `mixkit-609` chosen. Per-bed `BGM_GAIN`, because a sub-heavy bed
+   and a mid-bright one cannot share one number.
+
+4. **Found and worked around a real TTS defect** (see Next #3) — the most
+   reusable finding of the session; written up in `learning.md`.
+
+**Decisions that will look arbitrary later:**
+
+- `"Pre-voice"` in the VO script is a **pronunciation control, not a typo**.
+  espeak maps the real spelling to `pɹˈɪvYs` ("PRIV-oyss"), which Sid heard as
+  "prevaice"; the hyphenated form maps to `pɹˌivˈYs` ("pree-VOICE"). Do not
+  "correct" it.
+- The silence between question and reply in the video's cold open is **38 frames
+  = 1,272 ms**, a real measured turn, with a counter running through it. Cutting
+  it shorter would have been trivial and would have been the one lie the film
+  argues against.
+- Every number in the video's terminal scene is a real row from
+  `turn_log.jsonl`, per video-engine's honest-content rule.
+
+**Start next session by** asking whether the post went out and who the Telegram
+recipient is. If the launch is done, Next #3 (the TTS bug) is the highest-value
+code work and has a working reference implementation to copy.

@@ -5,6 +5,54 @@ how the project gets smarter rather than repeating itself.
 
 ---
 
+## 2026-08-12 · A lexicon TTS can delete words instead of mispronouncing them
+
+**Context:** The launch video's narration never said "Privoice", and the demo reply never
+said "Sid". It sounded like a pronunciation problem, so it got treated as one — nine
+spellings of Privoice and six of Sid, all failing. They were not being mispronounced,
+they were being **removed**. `kokoro_mlx` 0.1.1 builds misaki's G2P with no espeak
+fallback, so any out-of-lexicon word phonemizes to the literal `❓` token and is
+synthesized as *silence*, with no warning. A "John" control spoke fine, because John is
+in the lexicon.
+
+**Rule:** When a TTS drops a word, first ask whether it is *pronouncing* it badly or
+*deleting* it — the two have unrelated fixes and only one is a spelling problem. The tell
+is duration: every dropped variant produced byte-identical output length, which no
+pronunciation difference could. Check the G2P output directly
+(`misaki.en.G2P(...)("word")` → `'❓'`) before touching the text, and check the fallback
+is wired at all: `mlx_audio`'s `KokoroPipeline` constructs `EspeakFallback` and logs
+"EspeakFallback not Enabled: OOD words will be skipped" when it cannot — a warning nobody
+sees, because it fires at import.
+
+**Example:** Hours went into spelling variants and a phoneme splice (synthesize "acid",
+delete the leading vowel to leave /sɪd/) before checking the G2P itself, which took one
+line and gave the real fix. The splice was then deleted as dead code. Same failure as
+"check the premise, not just the steps" below: the premise "Kokoro says it wrong" was
+never verified.
+
+**Related:** the defect is live in the product, not just the video — the agent silently
+deletes any proper noun outside Kokoro's lexicon, including its user's name. It is the
+TTS-side twin of `issues/0007`.
+
+---
+
+## 2026-08-12 · Spelling in a TTS script is a control surface, not prose
+
+**Context:** With the G2P fixed, espeak mapped "Privoice" to `pɹˈɪvYs` — "PRIV-oyss" —
+which Sid heard as "prevaice". Writing it "Pre-voice" maps to `pɹˌivˈYs`, "pree-VOICE".
+Nothing about the model changed; only the input spelling.
+
+**Rule:** In a generated-voice script, the spelling of a proper noun is a parameter, not
+a typo. Pick it by reading the phonemes the G2P actually returns rather than by ear
+alone, and **comment it in the source** — the next person to see "Pre-voice" in a file
+about Privoice will otherwise "fix" it and silently break the pronunciation.
+
+**Example:** `Work/video-engine/apps/privoice/video/scripts/generate-vo-kokoro.py` carries
+the mapping and the reason in a comment directly above `LINES`, and the brief repeats it
+under "Decisions worth keeping".
+
+---
+
 ## 2026-08-12 · Snapshot the dataset before you publish statistics from it
 
 **Context:** The first conversational write-up quoted 2,143 ms median from 16 turns.

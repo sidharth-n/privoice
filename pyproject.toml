@@ -3,8 +3,16 @@ name = "privoice"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    # espeakng-loader + phonemizer-fork are what let misaki fall back to espeak
+    # for words outside Kokoro's lexicon. They arrive transitively today, but
+    # transitively is not good enough: without them TTS does not mispronounce an
+    # unknown name, it silently deletes it (see KokoroTts in engines.py). Pinned
+    # here so a fresh clone cannot end up in that state by accident.
+    "espeakng-loader>=0.2.4",
     "httpx>=0.28.1",
-    "kokoro-mlx>=0.1.1",
+    "kokoro-mlx>=0.1.1",   # TTS_ENGINE=kokoro-legacy only; not the default path
+    "misaki>=0.9.4",
+    "phonemizer-fork>=3.3.2",
     "livekit>=1.1.6",
     "mlx>=0.31.2",
     "mlx-audio>=0.4.6",

@@ -10,7 +10,7 @@ away. Turn detection defaults off deliberately — see issues/0005.
 
     STT_ENGINE=parakeet    (default; also venice, moonshine, nemotron,
                             nemotron-8bit, whisper, or any mlx-audio repo id)
-    TTS_ENGINE=kokoro      (default; also venice)
+    TTS_ENGINE=kokoro      (default; also kokoro-legacy, venice)
     TURN_DETECTOR=off      (default; also smartturn)
 
 `venice` runs the same checkpoints through Venice's hosted API instead of on
@@ -275,13 +275,100 @@ class VeniceStt:
 
 
 class KokoroTts:
-    """Kokoro 82M via `kokoro_mlx`. Fast, English-centric, 24 kHz out.
+    """Kokoro 82M via mlx-audio's `KokoroPipeline`. English-centric, 24 kHz out.
 
-    Pinned to kokoro-mlx 0.1.1 by the interpreter: 0.1.2 requires Python <3.13
-    and this venv is 3.13. That ceiling is one reason the TTS slot exists.
+    Drives mlx_audio rather than `kokoro_mlx` because of a silent, product-level
+    defect in the latter. kokoro-mlx 0.1.1 builds misaki's G2P with **no espeak
+    fallback**, so any word outside Kokoro's lexicon phonemizes to the empty
+    string and is synthesized as *silence*. Not mispronounced — deleted, with no
+    warning. That removed "Privoice" and the user's own name from every reply.
+
+    The tell was duration, not sound: "Say Privoice now." and "Say Sid now."
+    both produced exactly 33,600 samples, which no pronunciation difference
+    could explain, while "John" (in the lexicon) produced 39,000. Verified
+    directly against the G2P — `misaki.en.G2P(fallback=None)("Privoice")`
+    returns `''`, and with the fallback returns `pɹˈɪvYs`.
+
+    `KokoroPipeline` constructs `misaki.espeak.EspeakFallback` itself. Measured
+    time-to-first-audio is unchanged by the swap (170/264/446 ms at 13/34/72
+    characters, against 190/217/442 ms for kokoro_mlx — inside run-to-run noise).
+
+    The old engine stays reachable as `TTS_ENGINE=kokoro-legacy` so the
+    previously shipping path is still one env var away.
     """
 
     name = "kokoro"
+    REPO = "prince-canuma/Kokoro-82M"
+
+    def __init__(self, voice: str | None = None, repo: str | None = None) -> None:
+        from mlx_audio.tts.models.kokoro import KokoroPipeline
+        from mlx_audio.tts.utils import load_model
+
+        self._repo = repo or os.environ.get("KOKORO_REPO", self.REPO)
+        self._voice = voice or "af_heart"
+        self._speed = float(os.environ.get("TTS_SPEED", "1.0"))
+        self.sample_rate = 24000
+        self._pipe = KokoroPipeline(
+            lang_code="a", model=load_model(self._repo), repo_id=self._repo
+        )
+        _check_g2p_fallback(self._pipe)
+
+    def stream(self, sentence: str) -> Iterator[np.ndarray]:
+        for result in self._pipe(sentence, voice=self._voice, speed=self._speed):
+            audio = getattr(result, "audio", None)
+            if audio is None:
+                continue
+            yield np.asarray(audio, dtype=np.float32).flatten()
+
+    def warmup(self) -> None:
+        for _ in self.stream("Hi."):
+            pass
+
+    def close(self) -> None:
+        pass
+
+
+def _check_g2p_fallback(pipeline) -> None:  # noqa: ANN001
+    """Refuse to run with a G2P that will silently delete words.
+
+    `KokoroPipeline` logs "EspeakFallback not Enabled: OOD words will be
+    skipped" and carries on when espeak cannot be loaded. Nobody sees that —
+    it fires at construction, into the logging module, behind model-download
+    progress bars — and the symptom arrives hours later as proper nouns
+    missing from speech. Converting it into a startup error is the entire
+    lesson of that bug: a failure this quiet has to be made loud at the only
+    moment it is cheap to fix.
+
+    `espeakng-loader` ships the library as a wheel, so the usual cause is a
+    missing dependency rather than a missing system package.
+    """
+    if getattr(getattr(pipeline, "g2p", None), "fallback", None) is not None:
+        return
+    if os.environ.get("KOKORO_ALLOW_NO_ESPEAK", "0") == "1":
+        print(
+            "[tts] WARNING: no espeak fallback — words outside Kokoro's lexicon "
+            "(names, 'Privoice') will be SILENTLY DROPPED from speech.",
+            flush=True,
+        )
+        return
+    raise SystemExit(
+        "Kokoro's espeak fallback failed to load. Without it any word outside\n"
+        "Kokoro's lexicon — including names and 'Privoice' — is not\n"
+        "mispronounced but silently deleted from the audio.\n\n"
+        "Fix:  uv sync        (installs espeakng-loader + phonemizer-fork)\n"
+        "Override, accepting dropped words:  KOKORO_ALLOW_NO_ESPEAK=1"
+    )
+
+
+class KokoroLegacyTts:
+    """The previously shipping Kokoro path, via `kokoro_mlx`.
+
+    Kept so the old behaviour stays reproducible and the A/B is still runnable,
+    but it is not the default: it drops out-of-lexicon words (see `KokoroTts`).
+    Pinned to kokoro-mlx 0.1.1 by the interpreter — 0.1.2 requires Python <3.13.
+    """
+
+    name = "kokoro-legacy"
 
     def __init__(self, voice: str | None = None) -> None:
         from kokoro_mlx import DEFAULT_VOICE, KokoroTTS
@@ -516,13 +603,15 @@ def build_tts() -> TtsEngine:
     choice = os.environ.get("TTS_ENGINE", "kokoro").strip().lower()
     if choice == "kokoro":
         return KokoroTts(voice=os.environ.get("TTS_VOICE") or None)
+    if choice in ("kokoro-legacy", "kokoro_legacy"):
+        return KokoroLegacyTts(voice=os.environ.get("TTS_VOICE") or None)
     if choice == "venice":
         return VeniceTts(
             voice=os.environ.get("VENICE_TTS_VOICE") or None,
             model=os.environ.get("VENICE_TTS_MODEL") or None,
         )
     raise SystemExit(
-        f"unknown TTS_ENGINE={choice!r}. available: kokoro, venice"
+        f"unknown TTS_ENGINE={choice!r}. available: kokoro, kokoro-legacy, venice"
     )
 
 
