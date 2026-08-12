@@ -131,6 +131,101 @@ turn — the one a user notices most — **hybrid is 5.7× faster than all-local
 The warm comparison flatters local. The cold comparison is the honest one for
 anything that isn't a benchmark, and it reverses the conclusion.
 
+## What a real conversation measures — and why it is 1.6× the synthetic number
+
+Everything above comes from `scripts/bench_stack.py`: one fixed short prompt,
+one `say`-rendered utterance, each slot timed on its own. That is the right
+shape for "how fast is Kokoro" and the wrong shape for "how long does a turn
+take". So every live turn now writes its own stage breakdown to
+`turn_log.jsonl` (`turnlog.py`), and a conversation is also a benchmark run.
+
+**16 turns of ordinary conversation, hybrid config, one sitting, 2026-08-12.**
+Real speech from a person, not `say`. Medians, measured from end-of-speech —
+which is when the human starts waiting, and is *not* where the old `[ttfa]`
+print started its clock.
+
+| Stage | Real conversation (n=16) | Synthetic bench | Ratio |
+|---|---|---|---|
+| STT | 364 ms | 63 ms | 5.8× |
+| LLM — first token | 959 ms | ~990 ms* | 1.0× |
+| LLM — first sentence | 1,092 ms | 990 ms | 1.1× |
+| TTS — first audio | 536 ms | 329 ms | 1.6× |
+| **→ first audio out** | **2,143 ms** | **1,381 ms** | **1.55×** |
+
+p90 first-audio was 3,007 ms; worst turn 5,492 ms; best 1,086 ms.
+
+\* first-sentence and TTFT are close on Venice for short replies; see the
+section above for where they diverge.
+
+**The hosted LLM is the only slot that behaved as advertised.** Its
+first-sentence time under real conditions is within 10% of the synthetic
+figure, which makes sense — the workload barely changed. Everything local got
+worse, and for two separate reasons.
+
+### STT degrades with real speech, and not only because it is longer
+
+Real utterances ran 2.8 s at the median against the 2.2 s synthetic probe, so
+some of the increase is simply more audio. But normalised, local Parakeet cost
+**106 ms per second of speech** in the pipeline against ~29 ms/s in isolation.
+That is `issues/0004` reproduced with a proper sample instead of an anecdote:
+the same model, the same machine, ~3.6× slower once it is one stage of a
+running pipeline rather than the only thing happening.
+
+### TTS time-to-first-audio is a linear function of sentence length
+
+Kokoro yields nothing until it has synthesized the **whole sentence**. Across
+16 turns, time-to-first-audio against the character count of the reply's first
+sentence fits:
+
+```
+tts_first_ms ≈ 101 ms + 9.1 ms per character        (R² = 0.94, n = 15)
+```
+
+One turn sat far off the line at 3,776 ms and is excluded from the fit; with it
+the slope is 13.3 ms/char at R² = 0.52. The relationship is otherwise tight
+enough to treat as mechanical.
+
+The consequence is that **the model's writing style sets the floor on
+perceived latency**. A reply opening with "Yeah, totally." speaks in 131 ms; one
+opening with a 165-character sentence takes 1,610 ms — a 12× spread on the
+same slot, same machine, same config, decided entirely by how the LLM chose to
+start the sentence. That is a bigger lever than any of the local-vs-hosted
+differences on this page, and no isolated benchmark can see it.
+
+### The decode-rate readings are contaminated by playback, and so is the pipeline
+
+The log initially showed LLM decode at 4.8 chunks/s — 24× worse than the
+115 tok/s measured synthetically. Splitting by reply shape explains it:
+
+| Reply | Measured decode | n |
+|---|---|---|
+| Single sentence | **110 chunks/s** | 7 |
+| Two or more sentences | **4.8 chunks/s** | 9 |
+
+Venice did not get slower. The pipeline stops reading. Tokens are pulled
+lazily through `sentence_stream`, and `player.speak_sentence()` blocks for the
+entire duration of playback, so while sentence one is being spoken **nothing is
+draining the LLM stream**. Single-sentence replies are fully drained before
+playback begins and report the true rate; multi-sentence replies report the
+rate of speech instead.
+
+This is a measurement artifact worth knowing about — `llm_chunk_s` and
+`llm_total_ms` are only meaningful on single-sentence turns — but it is also a
+real defect. `issues/0002` describes the gap before sentence two as TTS
+synthesizing synchronously. That is only half of it: at the moment sentence one
+finishes playing, sentence two's tokens **have not been requested yet**. The
+measured gap before later sentences was 376 ms at the median, and closing it
+means draining the LLM concurrently with playback, not just pre-synthesizing
+audio. Filed as `issues/0009` and `issues/0010`.
+
+### What this does not overturn
+
+The ranking is unchanged: hybrid is still the configuration to ship, the hosted
+LLM still carries its weight, and local STT/TTS are still far cheaper than a
+round trip. What changes is the **headline number**. `1,381 ms` is a real
+measurement of a synthetic workload and should be quoted as one. The number to
+quote for a conversation is **~2.1 s median, ~3.0 s p90**.
+
 ## What this means if you are building a voice agent
 
 1. **Put the LLM on Venice, keep STT and TTS on the device.** Small models are
@@ -141,6 +236,14 @@ anything that isn't a benchmark, and it reverses the conclusion.
    TTFT.** See the table above; the ranking changes depending on which you use.
 3. **Do not benchmark warm and ship cold.** A 26B local model is fast on the
    second turn and slow on the first, and users mostly experience the first.
+4. **Instrument the live turn, not just the slots.** Every finding in the
+   section above — STT degrading in-pipeline, TTS latency tracking sentence
+   length, the LLM stream stalling behind playback — is invisible to a
+   per-slot benchmark, and two of the three are larger effects than anything
+   the per-slot benchmark did find.
+5. **Constrain the first sentence.** Time-to-first-audio is ~9 ms per character
+   of it. Prompting the model to open briefly is worth more than any slot swap
+   available here.
 
 ## Reproducing this
 
@@ -156,6 +259,10 @@ uv run python scripts/bench_stack.py --slot llm --repeat 5 --no-local-llm \
 
 # local slots
 uv run python scripts/bench_stack.py --slot all --repeat 5
+
+# real-conversation numbers: talk to it, then read the log
+LLM_BACKEND=venice uv run python voice_agent.py
+uv run python scripts/analyze_turns.py
 ```
 
 Total Venice spend to produce every number on this page: **under $0.05**.
@@ -167,6 +274,11 @@ Total Venice spend to produce every number on this page: **under $0.05**.
   edge would look very different, and this says nothing about it.
 - One prompt, short replies. Longer generations shift the balance toward the
   faster decoder — Venice — and this benchmark does not capture that.
+- The 16-turn conversational sample is **hybrid only**. The equivalent
+  all-local and all-hosted conversations have not been run, so the
+  local-vs-hosted ranking still rests on the synthetic bench above. The
+  conversational section corrects the *magnitude* of the hybrid number, not
+  the comparison.
 - Quality is not measured anywhere here. Every number is latency. `venice-uncensored`
   and the local 26B were not compared on output quality at all, and nothing here
   should be read as a claim that either writes better replies.

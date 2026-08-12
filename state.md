@@ -8,6 +8,32 @@ slots and measure the two against each other. Everything before the fork is in
 
 ## Now
 
+**2026-08-12 (later): live turns are now instrumented, and the real numbers
+are worse than the synthetic ones.** Every turn appends a full stage breakdown
+to `turn_log.jsonl` (`turnlog.py`); `scripts/analyze_turns.py` reports medians
+and p90 per stage grouped by config; `scripts/smoke_turnlog.py` is the
+multi-turn regression test for the path.
+
+16 real conversational turns on hybrid: **2,143 ms median / 3,007 ms p90** to
+first audio, against the 1,381 ms the per-slot benchmark predicted. Ranking
+unchanged, magnitude 1.55× optimistic. Three findings, all invisible to
+`bench_stack.py`:
+
+- STT costs **106 ms per second of speech** in-pipeline vs ~29 ms/s isolated
+  (`issues/0004`, now with real numbers).
+- TTS time-to-first-audio ≈ **101 ms + 9.1 ms per character** of the reply's
+  first sentence, R²=0.94 — so the model's opening phrase is the biggest
+  latency lever in the system (`issues/0010`, new).
+- The LLM stream is **not drained during playback**, so sentence two's tokens
+  are not even requested until sentence one finishes speaking (`issues/0009`,
+  new — the larger half of `issues/0002`, and must land first).
+
+Written up in `docs/BENCHMARK.md` → "What a real conversation measures".
+Still outstanding from this: the all-local and all-hosted *conversational*
+runs have not been done, so only the hybrid magnitude is corrected.
+
+## Earlier today
+
 The Venice port is done and measured. Every slot (STT, LLM, TTS) swaps between
 on-device and Venice's hosted API by env var. **The local path is still the
 default and is unchanged** — the port is purely additive, so nothing regressed.
@@ -37,12 +63,20 @@ configurations and producing real reply audio.
 
 ## Next
 
-1. **Record a demo.** A voice project with no audible artifact is unpersuasive.
+1. **`issues/0010` — prompt for a short first sentence.** A `SYSTEM_PROMPT`
+   line, no code. On the measured 9.1 ms/char it is worth several hundred ms
+   off every reply. Verify with `analyze_turns.py` before/after, not by ear.
+2. **`issues/0009` — drain the LLM stream concurrently with playback.** Then
+   `issues/0002`. Constraints in the issue: barge-in cancel must reach the
+   producer, and no new thread per turn.
+3. **Conversational runs for all-local and all-hosted**, so the local-vs-hosted
+   comparison rests on the same kind of data the hybrid number now does.
+4. **Record a demo.** A voice project with no audible artifact is unpersuasive.
    `out_reply.wav` exists, but a screen recording of a live barge-in turn in
    hybrid mode is what the README actually needs.
-2. **Rotate the Venice API key** — the one in `.env` was pasted into a chat
+5. **Rotate the Venice API key** — the one in `.env` was pasted into a chat
    transcript during development.
-3. Longer-generation benchmark. Every current number uses one short prompt,
+6. Longer-generation benchmark. Every current number uses one short prompt,
    which structurally favours the slower decoder (local). Longer replies should
    shift the balance toward Venice; untested.
 4. Concurrency. All measurements are single-client and sequential, so the main

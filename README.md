@@ -26,6 +26,14 @@ medians. Method, controls and limits: **[docs/BENCHMARK.md](docs/BENCHMARK.md)**
 | All Venice | 3,672 ms | 3,672 ms |
 | **Hybrid — local STT/TTS, Venice LLM** | **1,381 ms** | **1,381 ms** |
 
+Those are per-slot measurements on a fixed short prompt. **A real conversation
+is slower**: 16 live turns on the hybrid config measured **2,143 ms median /
+3,007 ms p90** to first audio. The ranking holds, the magnitude does not — the
+synthetic figure is 1.55× optimistic, and the gap is almost entirely in the two
+local slots. Every live turn now logs its own breakdown, so this is measured
+rather than assumed; see
+[docs/BENCHMARK.md](docs/BENCHMARK.md#what-a-real-conversation-measures--and-why-it-is-16-the-synthetic-number).
+
 Three results, and the first two were not what I expected.
 
 **1. All-hosted is 2.2× slower than a laptop** — but not because the GPUs are

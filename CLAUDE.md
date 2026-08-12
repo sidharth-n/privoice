@@ -4,10 +4,16 @@ A real-time voice agent. Mic in → spoken reply out. Every slot (STT, LLM, TTS)
 runs either on-device or on Venice's hosted API, selected by env var. Forked
 2026-08-12 from `uncensored-local-voice`, which was local-only.
 
-**Measured latency (2026-08-12, this M5, 5 samples/slot — see `docs/BENCHMARK.md`):**
-all-local 1,642 ms · all-Venice 3,672 ms · **hybrid (local STT/TTS + Venice LLM)
-1,381 ms**. Cold start, which is the realistic first turn: local 7,824 ms vs
-hybrid 1,381 ms.
+**Measured latency (2026-08-12, this M5 — see `docs/BENCHMARK.md`):**
+
+- *Synthetic, per-slot, 5 samples* (`scripts/bench_stack.py`): all-local
+  1,642 ms · all-Venice 3,672 ms · **hybrid 1,381 ms**. Cold start, the
+  realistic first turn: local 7,824 ms vs hybrid 1,381 ms.
+- *Real conversation, 16 turns, hybrid* (`turn_log.jsonl`): **2,143 ms median,
+  3,007 ms p90** to first audio. The synthetic figure is 1.55× optimistic —
+  quote it as a per-slot measurement, never as conversational latency.
+
+The ranking is unchanged (hybrid wins); the magnitude is not.
 
 The original "<1 s warm" claim from the local build was never met — see
 `issues/0003`. The LLM's **first-sentence** time is the dominant cost, and

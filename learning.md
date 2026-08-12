@@ -5,6 +5,52 @@ how the project gets smarter rather than repeating itself.
 
 ---
 
+## 2026-08-12 · Measuring a producer through a lazy consumer measures the consumer
+
+**Context:** The new per-turn log reported the hosted LLM decoding at 4.8 chunks/s —
+24× worse than the 115 tok/s `bench_stack.py` measured for the same model minutes
+earlier. Nothing had changed on Venice's side. Tokens are pulled lazily through
+`sentence_stream`, and `speak_sentence()` blocks for the whole duration of playback,
+so while sentence one was being spoken nothing was reading the stream. The "decode
+rate" was the rate of speech.
+
+**Rule:** Before believing a throughput number, ask what is pulling the iterator and
+whether it ever stops pulling. A generator's timing reflects the slowest thing in the
+consumption chain, not the producer. Splitting the sample by a structural property of
+the consumer — here, one-sentence vs multi-sentence replies — separates the two in one
+step: single-sentence replies drained before playback began and reported 110 chunks/s,
+matching the isolated benchmark and proving the 4.8 was backpressure.
+
+**Example:** The artifact was also a real defect. `issues/0002` blamed the gap before
+sentence two on synchronous TTS; the log showed sentence two's *tokens* had not been
+requested either. Filed as `issues/0009`, and it has to land before `0002` or fixing
+`0002` closes half a gap.
+
+---
+
+## 2026-08-12 · Per-slot benchmarks cannot see the effects that dominate a real turn
+
+**Context:** `bench_stack.py` timed each slot in isolation against one fixed short
+prompt and produced the headline 1,381 ms hybrid figure. Sixteen turns of actual
+conversation measured 2,143 ms median / 3,007 ms p90 — and the three biggest
+contributors were all invisible to the per-slot harness: STT costing 106 ms per second
+of speech in-pipeline vs ~29 ms/s isolated, TTS time-to-first-audio scaling at ~9 ms
+per character of the reply's first sentence (R²=0.94), and the LLM stalling behind
+playback.
+
+**Rule:** A benchmark that holds the workload fixed measures the slot, not the system.
+If the deliverable is a latency claim about a *pipeline*, instrument the live path and
+report from it — the cheap version is one log line per turn, which turns every real use
+into a sample. Keep the isolated numbers, but label which is which and never let the
+synthetic one be quoted as the product's latency.
+
+**Example:** The largest single lever found was not a slot at all — the model's choice
+of opening phrase. Identical hardware and config produced 131 ms to first audio on
+"Yeah, totally." and 1,610 ms on a 165-character opener. That is a bigger spread than
+local-vs-hosted TTS, and no fixed-prompt benchmark can produce it.
+
+---
+
 ## 2026-07-30 · Check the premise of a plan before executing it, not just the steps
 
 **Context:** `issues/0003` said "the LLM is slow because it's dense — swap in a sparse
