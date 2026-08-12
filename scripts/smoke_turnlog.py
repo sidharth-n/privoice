@@ -92,7 +92,7 @@ def main() -> int:
     models = load_models()
     player = TTSPlayer(models.tts, models.apm)
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
-    state = {"speaking": False, "tts_audible": False, "resume_at": 0.0,
+    state = {"speaking": False, "resume_at": 0.0,
              "user_just_ended": 0.0, "loud_streak": 0, "barge_fired": False}
 
     # The persistent-worker shape from voice_agent.main(). A thread per turn
@@ -111,12 +111,11 @@ def main() -> int:
         while True:
             audio, cancel, t_end = turn_q.get()
             try:
-                respond(audio, models, history, player, cancel, state, t_end)
+                respond(audio, models, history, player, cancel, t_end)
             except Exception as e:
                 print(f"[turn failed] {type(e).__name__}: {e}", flush=True)
             finally:
                 state["speaking"] = False
-                state["tts_audible"] = False
                 sem.release()
 
     threading.Thread(target=worker, daemon=True).start()

@@ -133,14 +133,27 @@ def report(rows: list[dict]) -> None:
 
         multi = [t for t in spoke if len(t.get("sentences", [])) > 1]
         if multi:
-            # issues/0002: sentence 2+ is synthesized only after sentence 1 has
-            # finished playing, so the listener hears a gap. The synthesis time
-            # of later sentences is the size of that gap.
-            later = [s["synth_first_ms"] for t in multi
-                     for s in t["sentences"][1:] if s.get("synth_first_ms") is not None]
-            if later:
-                print(f"  gap before later sentences (issues/0002): "
-                      f"median {statistics.median(later):.0f}ms over {len(later)} sentences")
+            # issues/0002. `gap_ms` is silence the listener actually heard
+            # between sentences: first frame of sentence N+1 minus last frame of
+            # sentence N, both stamped by the playback thread.
+            #
+            # Rows written before synthesis and playback were split have no
+            # `gap_ms`. For those, fall back to the old proxy — the synthesis
+            # time of later sentences — which was equal to the gap back when
+            # synthesis only started after playback finished. The two are not
+            # comparable, so they are reported under different labels rather
+            # than pooled: pooling them would show the fix making things worse.
+            heard = [s["gap_ms"] for t in multi
+                     for s in t["sentences"][1:] if s.get("gap_ms") is not None]
+            legacy = [s["synth_first_ms"] for t in multi
+                      for s in t["sentences"][1:]
+                      if s.get("gap_ms") is None and s.get("synth_first_ms") is not None]
+            if heard:
+                print(f"  gap heard between sentences (issues/0002): "
+                      f"median {statistics.median(heard):.0f}ms over {len(heard)} sentences")
+            if legacy:
+                print(f"  gap before later sentences, pre-split rows (issues/0002): "
+                      f"median {statistics.median(legacy):.0f}ms over {len(legacy)} sentences")
 
         cut = sum(1 for t in turns if t.get("interrupted"))
         if cut:

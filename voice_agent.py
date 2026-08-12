@@ -249,6 +249,70 @@ def _stream_llm_venice(history: list[dict], client: httpx.Client, cancel: thread
                 yield tok
 
 
+_STREAM_END = object()
+
+
+class LlmStreamer:
+    """Drains the model's token stream on a dedicated long-lived thread.
+
+    Why a thread at all: playback blocks for the real duration of the audio, and
+    tokens used to be pulled lazily *through* that block. While sentence one was
+    being spoken, nothing was reading the socket — so when sentence two was
+    needed, its tokens had not even been requested. The gap before later
+    sentences was an LLM round trip plus synthesis, not synthesis alone
+    (`issues/0009`).
+
+    It also made the logged decode rate meaningless on multi-sentence replies:
+    it measured the rate of *speech*, 5.8 chunks/s, against the model's true
+    122. Timing a producer through a lazy consumer measures the consumer.
+
+    Why one long-lived thread rather than one per turn: `learning.md`
+    (2026-07-30) records a fatal interpreter crash from tearing down
+    thread-local MLX Metal state when a thread exits. This thread touches only
+    httpx and json, so a per-turn thread would very likely be fine — but
+    "very likely" is not worth re-testing on a bug that killed the process.
+    """
+
+    def __init__(self) -> None:
+        self._jobs: queue.Queue = queue.Queue()
+        threading.Thread(target=self._run, daemon=True, name="llm-drain").start()
+
+    def stream(self, history, client, cancel, stats, origin):
+        """Yield tokens that are already being fetched, not fetched on demand."""
+        out: queue.Queue = queue.Queue()
+        # Copy the history: `respond()` appends to it as soon as the reply
+        # lands, and the producer is reading it on another thread.
+        self._jobs.put((list(history), client, cancel, stats, origin, out))
+        while True:
+            item = out.get()
+            if item is _STREAM_END:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    def _run(self) -> None:
+        while True:  # never returns — exiting is what crashes the interpreter
+            history, client, cancel, stats, origin, out = self._jobs.get()
+            try:
+                for tok in stream_llm(history, client, cancel):
+                    # Stamped on the producer, not the consumer. That is the
+                    # whole point of this class: the two are now different
+                    # clocks and only this one measures the model.
+                    t = time.perf_counter()
+                    if stats["ttft"] is None:
+                        stats["ttft"] = (t - origin) * 1000.0
+                    stats["chunks"] += 1
+                    stats["last"] = (t - origin) * 1000.0
+                    out.put(tok)
+                    if cancel.is_set():
+                        break
+            except BaseException as e:  # noqa: BLE001 — re-raised on the consumer
+                out.put(e)
+            finally:
+                out.put(_STREAM_END)
+
+
 def sentence_stream(token_iter):
     buf = ""
     for tok in token_iter:
@@ -312,6 +376,7 @@ class Models:
     turn: TurnDetector
     apm: AudioProcessingModule | None
     client: httpx.Client
+    llm: LlmStreamer
 
 
 def load_models() -> Models:
@@ -375,7 +440,10 @@ def load_models() -> Models:
         print("[4/4] AEC disabled (HALF_DUPLEX=1)", flush=True)
 
     client = httpx.Client(timeout=httpx.Timeout(120.0))
-    return Models(vad=vad, stt=stt, tts=tts, turn=turn, apm=apm, client=client)
+    return Models(
+        vad=vad, stt=stt, tts=tts, turn=turn, apm=apm, client=client,
+        llm=LlmStreamer(),
+    )
 
 
 def warmup(models: Models) -> None:
@@ -424,13 +492,34 @@ def warmup(models: Models) -> None:
 # ─────────────────────────────── playback ─────────────────────────────
 
 
-class TTSPlayer:
-    """Streams TTS through the APM reverse stream, then to speakers, in 10 ms frames.
+# How many sentences may sit synthesized-and-waiting ahead of the speaker.
+# This is the whole point of the split thread — but it must be bounded, or a
+# long reply synthesizes in full before the first word is spoken and a barge-in
+# throws all of it away. Two is enough to cover any sentence boundary.
+TTS_MAX_AHEAD = int(os.environ.get("TTS_MAX_AHEAD", "2"))
 
-    Why play in 10 ms frames at 16 kHz: the APM requires its reverse stream
-    to be exactly 10 ms wide, and AEC works best when the same audio that we
-    feed to APM is what the speaker actually emits. So we resample Kokoro's
-    24 kHz output down to 16 kHz once, then write it both ways in lockstep.
+
+class TTSPlayer:
+    """Synthesizes on the caller's thread, plays on a thread of its own.
+
+    Why the split. `stream.write()` blocks for the real duration of the audio.
+    While synthesis and playback shared a thread, sentence two could not start
+    synthesizing until sentence one had finished *playing*, so every sentence
+    boundary cost a full synthesis — 293 ms median (`issues/0002`). With
+    playback on its own thread the caller runs ahead, and sentence two's audio
+    is ready before sentence one stops.
+
+    The playback thread deliberately owns no MLX state. `learning.md`
+    (2026-07-30) records that thread-local Metal state torn down on thread exit
+    kills the interpreter, so synthesis stays on the persistent turn worker and
+    this thread only feeds the APM reverse stream and writes int16. It is
+    long-lived for the same reason and never exits.
+
+    Why 10 ms frames at 16 kHz: the APM requires its reverse stream to be
+    exactly that, and AEC works best when the reference is bit-identical to
+    what the speaker emits. Kokoro's 24 kHz output is resampled once, on the
+    synthesis side, so the playback thread stays as close to a pure device
+    writer as possible and its timestamps mean what they say.
     """
 
     def __init__(self, tts: TtsEngine, apm: AudioProcessingModule | None):
@@ -442,72 +531,130 @@ class TTSPlayer:
             samplerate=self.out_sr, channels=1, dtype="int16", blocksize=APM_FRAME
         )
         self.stream.start()
+
+        # True only while frames are actually reaching the speaker. The barge-in
+        # gate keys off this rather than "a reply is in progress": with
+        # synthesis running ahead, those two are no longer the same instant, and
+        # arming the echo gate before any sound exists would suppress a real
+        # interruption during the silent pre-audio phase.
+        self.audible = False
+
         self._cancel = threading.Event()
         self._lock = threading.Lock()
+        self._q: queue.Queue = queue.Queue()
+        # Bounds how far synthesis may run ahead of the speaker.
+        self._slots = threading.Semaphore(TTS_MAX_AHEAD)
+        self._pending = 0
+        self._idle = threading.Event()
+        self._idle.set()
         # Exponential moving average of what we are sending to the speaker.
         # The barge-in gate uses this to scale itself with echo, so it must be
         # cheap and updated on every frame we actually write.
         self._out_rms = 0.0
 
+        threading.Thread(target=self._play_loop, daemon=True, name="tts-play").start()
+
     def output_rms(self) -> float:
         """Recent RMS of audio sent to the speaker; 0.0 when silent."""
         return self._out_rms
 
-    def is_active(self) -> bool:
-        with self._lock:
-            return not self._cancel.is_set()
+    def begin_reply(self) -> None:
+        """Re-arm for a new reply.
 
-    def speak_sentence(self, sentence: str) -> dict:
-        """Synthesize and play one sentence; return what it cost.
-
-        The returned `synth_ms` deliberately excludes time spent blocked in
-        `stream.write()`. Playback blocks for the real duration of the audio,
-        so a naive wall-clock measurement of this method reports roughly the
-        length of the sentence and tells you nothing about whether TTS is
-        keeping up. Timing only the generator separates "how fast can Kokoro
-        make audio" from "how long is the audio" — which is the distinction
-        `issues/0002` turns on, since the gap before sentence two is synthesis
-        happening after playback rather than during it.
+        Cancellation is per *reply*, not per sentence. The previous code cleared
+        the cancel flag at the top of every sentence, which meant a barge-in
+        landing between two sentences was forgotten by the next one.
         """
         with self._lock:
             self._cancel.clear()
-            cancel = self._cancel
+
+    def speak_sentence(self, sentence: str) -> dict:
+        """Synthesize one sentence and hand it to the speaker. Does not block on playback.
+
+        Returns a dict that is still being written to: `t_first_frame` and
+        `audio_s` are filled in by the playback thread. Read them after
+        `wait_idle()`, not before.
+
+        `synth_ms` covers only the generator, never the device write — that
+        distinction is what separates "how fast can Kokoro make audio" from
+        "how long is the audio", and it is the measurement `issues/0002` turns
+        on.
+        """
+        self._slots.acquire()
 
         m = {
             "text": sentence,
             "synth_first_ms": None,   # text in -> first audio chunk out
             "synth_ms": 0.0,          # generator time only, no playback
-            "audio_s": 0.0,
-            "t_first_frame": None,    # perf_counter when audio hit the speaker
+            "audio_s": 0.0,           # written by the playback thread
+            "t_first_frame": None,    # written by the playback thread
+            "t_last_frame": None,     # written by the playback thread
+            "complete": False,        # written by the playback thread
         }
+        with self._lock:
+            self._pending += 1
+            self._idle.clear()
+
         t_start = time.perf_counter()
-
-        residual = np.zeros(0, dtype=np.float32)
-        # Stepped by hand rather than with `for`, so the clock covers only the
-        # generator and stops while we are blocked writing to the device.
-        stream_iter = iter(self.tts.stream(sentence))
-        while True:
-            t_gen = time.perf_counter()
-            try:
-                arr = next(stream_iter)
-            except StopIteration:
-                m["synth_ms"] += (time.perf_counter() - t_gen) * 1000.0
-                break
-            m["synth_ms"] += (time.perf_counter() - t_gen) * 1000.0
-            if m["synth_first_ms"] is None:
-                m["synth_first_ms"] = (time.perf_counter() - t_start) * 1000.0
-            if cancel.is_set():
+        try:
+            if self._cancel.is_set():
                 return m
-            if self.in_sr != self.out_sr:
-                arr = linear_resample(arr, self.in_sr, self.out_sr).astype(np.float32)
-            buf = np.concatenate([residual, arr])
-
-            n_full = len(buf) // APM_FRAME
-            for i in range(n_full):
-                if cancel.is_set():
+            residual = np.zeros(0, dtype=np.float32)
+            # Stepped by hand rather than with `for`, so the clock covers only
+            # the generator and not the queueing around it.
+            stream_iter = iter(self.tts.stream(sentence))
+            while True:
+                t_gen = time.perf_counter()
+                try:
+                    arr = next(stream_iter)
+                except StopIteration:
+                    m["synth_ms"] += (time.perf_counter() - t_gen) * 1000.0
+                    break
+                m["synth_ms"] += (time.perf_counter() - t_gen) * 1000.0
+                if m["synth_first_ms"] is None:
+                    m["synth_first_ms"] = (time.perf_counter() - t_start) * 1000.0
+                if self._cancel.is_set():
                     return m
-                frame_f32 = buf[i * APM_FRAME : (i + 1) * APM_FRAME]
-                frame_i16 = f32_to_i16(frame_f32)
+                if self.in_sr != self.out_sr:
+                    arr = linear_resample(arr, self.in_sr, self.out_sr).astype(np.float32)
+                buf = np.concatenate([residual, arr])
+                n_full = len(buf) // APM_FRAME
+                if n_full:
+                    self._q.put(("frames", m, f32_to_i16(buf[: n_full * APM_FRAME])))
+                residual = buf[n_full * APM_FRAME :]
+
+            if len(residual) > 0 and not self._cancel.is_set():
+                pad = np.zeros(APM_FRAME - len(residual), dtype=np.float32)
+                self._q.put(("frames", m, f32_to_i16(np.concatenate([residual, pad]))))
+        finally:
+            # Always posted, including on cancel or synthesis error, so the
+            # playback thread has exactly one place to settle the bookkeeping
+            # and release the slot. Two release points is how this leaks.
+            self._q.put(("end", m))
+        return m
+
+    def _play_loop(self) -> None:
+        while True:  # never returns — see the class docstring
+            kind, m, *rest = self._q.get()
+            if kind == "end":
+                # Settled here rather than on the synthesis side, because only
+                # this thread knows whether the frames actually got written.
+                m["complete"] = not self._cancel.is_set()
+                with self._lock:
+                    self._pending -= 1
+                    if self._pending == 0:
+                        self.audible = False
+                        self._out_rms = 0.0
+                        self._idle.set()
+                self._slots.release()
+                continue
+            if self._cancel.is_set():
+                continue
+            block = rest[0]
+            for i in range(0, len(block), APM_FRAME):
+                if self._cancel.is_set():
+                    break
+                frame_i16 = block[i : i + APM_FRAME]
                 if self.apm is not None:
                     af = AudioFrame(
                         data=frame_i16.tobytes(),
@@ -516,48 +663,38 @@ class TTSPlayer:
                         samples_per_channel=APM_FRAME,
                     )
                     self.apm.process_reverse_stream(af)
-                self._note_output(frame_f32)
+                self._note_output(frame_i16)
                 # Stamped before the write, not after: `write` blocks until the
                 # device has room, so stamping after would fold one frame of
                 # playback into what is meant to be the moment sound started.
                 if m["t_first_frame"] is None:
                     m["t_first_frame"] = time.perf_counter()
+                self.audible = True
                 self.stream.write(frame_i16)
+                # Stamped after the write, unlike t_first_frame: this one marks
+                # when the device accepted the last frame, which is what the
+                # next sentence's start time has to be compared against to see
+                # whether the speaker ever ran dry.
+                m["t_last_frame"] = time.perf_counter()
                 m["audio_s"] += APM_FRAME / self.out_sr
-            residual = buf[n_full * APM_FRAME :]
 
-        if len(residual) > 0 and not cancel.is_set():
-            pad = np.zeros(APM_FRAME - len(residual), dtype=np.float32)
-            tail = np.concatenate([residual, pad])
-            frame_i16 = f32_to_i16(tail)
-            if self.apm is not None:
-                af = AudioFrame(
-                    data=frame_i16.tobytes(),
-                    sample_rate=self.out_sr,
-                    num_channels=1,
-                    samples_per_channel=APM_FRAME,
-                )
-                self.apm.process_reverse_stream(af)
-            self._note_output(tail)
-            if m["t_first_frame"] is None:
-                m["t_first_frame"] = time.perf_counter()
-            self.stream.write(frame_i16)
-            m["audio_s"] += APM_FRAME / self.out_sr
+    def wait_idle(self, timeout: float | None = None) -> bool:
+        """Block until everything queued has played (or been cancelled)."""
+        return self._idle.wait(timeout)
 
-        return m
-
-    def _note_output(self, frame_f32: np.ndarray) -> None:
+    def _note_output(self, frame_i16: np.ndarray) -> None:
         """Fold one outgoing frame into the output-level estimate.
 
         Asymmetric smoothing: rise fast so the gate is already high when the
         agent starts talking, decay slower so it stays high through the brief
         dips between words rather than dropping and admitting an echo spike.
         """
-        r = float(np.sqrt(np.mean(frame_f32**2)))
+        r = float(np.sqrt(np.mean((frame_i16.astype(np.float32) / 32768.0) ** 2)))
         alpha = 0.5 if r > self._out_rms else 0.05
         self._out_rms = (1 - alpha) * self._out_rms + alpha * r
 
     def stop(self) -> None:
+        """Cut the current reply. Queued frames are dropped, markers still settle."""
         self._cancel.set()
 
     def close(self) -> None:
@@ -609,7 +746,6 @@ def main() -> int:
     continuations = 0  # times the turn detector deferred the current utterance
     state = {
         "speaking": False,
-        "tts_audible": False,
         "resume_at": 0.0,
         "user_just_ended": 0.0,
         "loud_streak": 0,         # consecutive AEC'd frames above the gate
@@ -636,13 +772,12 @@ def main() -> int:
         while True:  # never returns — exiting is precisely what crashes
             audio_buf, cancel, t_end = turn_q.get()
             try:
-                respond(audio_buf, models, history, player, cancel, state, t_end)
+                respond(audio_buf, models, history, player, cancel, t_end)
             except Exception as e:  # one bad turn must not kill the worker
                 print(f"\n[turn failed] {type(e).__name__}: {e}", flush=True)
             finally:
                 state["resume_at"] = time.monotonic() + TTS_TAIL_GRACE_MS / 1000.0
                 state["speaking"] = False
-                state["tts_audible"] = False
                 models.vad.reset_states()
 
     threading.Thread(target=turn_worker, daemon=True).start()
@@ -694,8 +829,13 @@ def main() -> int:
                 # triggers ranged 0.058-0.152, straddling any single threshold.
                 # Requiring the mic to exceed a multiple of concurrent TTS
                 # output makes the bar rise exactly when leakage does.
+                # `player.audible` rather than "a reply is in flight": synthesis
+                # now runs ahead of the speaker, so those are different
+                # instants, and raising the echo gate before any sound exists
+                # would suppress a real interruption during the silent
+                # pre-audio phase.
                 gate = BARGE_IN_RMS_GATE
-                if state["tts_audible"]:
+                if player.audible:
                     gate = max(gate, BARGE_IN_ECHO_FACTOR * player.output_rms())
 
                 if rms >= gate and is_speech:
@@ -707,7 +847,7 @@ def main() -> int:
                 # when the next reply starts.
                 if (
                     state["speaking"]
-                    and state["tts_audible"]
+                    and player.audible
                     and not state["barge_fired"]
                     and state["loud_streak"] >= BARGE_IN_SUSTAIN_FRAMES
                     and time.monotonic() - state["user_just_ended"] >= POST_USER_BARGE_LOCKOUT_S
@@ -783,7 +923,6 @@ def main() -> int:
                         active = False
                         continuations = 0
                         state["speaking"] = True
-                        state["tts_audible"] = False
                         state["user_just_ended"] = time.monotonic()
                         state["loud_streak"] = 0
                         state["barge_fired"] = False  # re-arm for the new reply
@@ -809,30 +948,12 @@ def main() -> int:
     return 0
 
 
-def _counted_tokens(token_iter, stats: dict, origin: float):
-    """Pass tokens through, recording when the first arrived and how many came.
-
-    Counts stream *deltas*, not tokenizer tokens — Ollama and Venice both emit
-    one delta per token in practice, but nothing guarantees it, so the field is
-    named `chunks` rather than `tokens` to keep an approximation from being
-    quoted as a measurement.
-    """
-    for tok in token_iter:
-        t = time.perf_counter()
-        if stats["ttft"] is None:
-            stats["ttft"] = (t - origin) * 1000.0
-        stats["chunks"] += 1
-        stats["last"] = (t - origin) * 1000.0
-        yield tok
-
-
 def respond(
     audio: np.ndarray,
     models: Models,
     history: list[dict],
     player: TTSPlayer,
     cancel: threading.Event,
-    state: dict,
     speech_end: float | None = None,
 ) -> None:
     # Every stage time is measured from end-of-speech, because that is when the
@@ -877,13 +998,17 @@ def respond(
     history[:] = trim_history(history)
 
     print("AI: ", end="", flush=True)
-    full_reply: list[str] = []
     t1 = time.perf_counter()
     llm_stats = {"ttft": None, "chunks": 0, "last": None}
 
     interrupted = False
+    metas: list[dict] = []
+    player.begin_reply()
     try:
-        tokens = _counted_tokens(stream_llm(history, models.client, cancel), llm_stats, t1)
+        # `llm_stats` counts stream *deltas*, not tokenizer tokens — Ollama and
+        # Venice both emit one delta per token in practice, but nothing
+        # guarantees it, so the field is `chunks` and not `tokens`.
+        tokens = models.llm.stream(history, models.client, cancel, llm_stats, t1)
         for sent in sentence_stream(tokens):
             if cancel.is_set():
                 interrupted = True
@@ -891,38 +1016,59 @@ def respond(
             print(sent + " ", end="", flush=True)
             if m.llm_first_sentence_ms is None:
                 m.llm_first_sentence_ms = (time.perf_counter() - t1) * 1000.0
-            state["tts_audible"] = True   # audio is now hitting the speaker; barge-in legit
-            sm = player.speak_sentence(sent)
-            m.sentences.append(
-                {
-                    "text": sent,
-                    "synth_first_ms": round(sm["synth_first_ms"], 2)
-                    if sm["synth_first_ms"] is not None
-                    else None,
-                    "synth_ms": round(sm["synth_ms"], 2),
-                    "audio_s": round(sm["audio_s"], 3),
-                }
-            )
-            if m.tts_first_ms is None:
-                m.tts_first_ms = sm["synth_first_ms"]
-            if m.first_audio_ms is None and sm["t_first_frame"] is not None:
-                m.first_audio_ms = (sm["t_first_frame"] - t_end) * 1000.0
-            m.tts_synth_ms += sm["synth_ms"]
-            m.tts_audio_s += sm["audio_s"]
+            metas.append(player.speak_sentence(sent))
             if cancel.is_set():
-                # Cut mid-sentence: the user heard part of this one at most, so
-                # recording it as spoken would put words in the agent's mouth
-                # that were never heard, and the model would then reason from a
-                # reply the user never got.
                 interrupted = True
                 break
-            full_reply.append(sent)
     except Exception as e:
         print(f"\n[error] {e}", flush=True)
         m.ok = False
         m.error = f"{type(e).__name__}: {e}"
 
+    # Synthesis now runs ahead of the speaker, so the turn is not over when the
+    # loop above ends — it is over when the last frame has been written. Every
+    # playback-side field below is only valid after this returns.
+    player.wait_idle()
     print()
+
+    for i, sm in enumerate(metas):
+        # `gap_ms` is the real `issues/0002` measurement: silence the listener
+        # actually heard between one sentence and the next. It replaces the old
+        # proxy — the synthesis time of later sentences — which was only ever
+        # equal to the gap because synthesis happened *after* playback. Now that
+        # the two overlap, that proxy measures work done underneath the audio
+        # and would report a gap where there is none.
+        gap = None
+        if i > 0 and sm["t_first_frame"] is not None:
+            prev_end = metas[i - 1]["t_last_frame"]
+            if prev_end is not None:
+                gap = round((sm["t_first_frame"] - prev_end) * 1000.0, 2)
+        m.sentences.append(
+            {
+                "text": sm["text"],
+                "synth_first_ms": round(sm["synth_first_ms"], 2)
+                if sm["synth_first_ms"] is not None
+                else None,
+                "synth_ms": round(sm["synth_ms"], 2),
+                "audio_s": round(sm["audio_s"], 3),
+                "gap_ms": gap,
+            }
+        )
+        m.tts_synth_ms += sm["synth_ms"]
+        m.tts_audio_s += sm["audio_s"]
+    if metas:
+        m.tts_first_ms = metas[0]["synth_first_ms"]
+        if metas[0]["t_first_frame"] is not None:
+            m.first_audio_ms = (metas[0]["t_first_frame"] - t_end) * 1000.0
+
+    # A sentence counts as spoken only if it played through. Recording one that
+    # was synthesized but cut — or never reached the speaker at all — would put
+    # words in the agent's mouth that were never heard, and the model would then
+    # reason from a reply the user never got. With synthesis running ahead of
+    # playback this is no longer the same thing as "we finished the loop".
+    full_reply = [sm["text"] for sm in metas if sm["complete"] and sm["audio_s"] > 0]
+    if len(full_reply) < len(metas):
+        interrupted = True
     m.llm_ttft_ms = llm_stats["ttft"]
     m.llm_total_ms = llm_stats["last"]
     m.llm_chunks = llm_stats["chunks"]
