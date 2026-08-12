@@ -140,6 +140,7 @@ MIN_UTTERANCE_SAMPLES = SR * MIN_UTTERANCE_MS // 1000
 # get exactly the previous behaviour.
 SPECULATE = os.environ.get("SPECULATE", "1") == "1"
 SPECULATE_AFTER_MS = int(os.environ.get("SPECULATE_AFTER_MS", "200"))
+SPEC_DEBUG = os.environ.get("SPEC_DEBUG", "0") == "1"
 
 HISTORY_FILE = Path(__file__).resolve().parent / ".voice_history.json"
 HISTORY_MAX_TURNS = int(os.environ.get("HISTORY_MAX_TURNS", "8"))
@@ -785,18 +786,56 @@ def main() -> int:
     mode = "FULL-DUPLEX + AEC + barge-in" if models.apm is not None else "HALF-DUPLEX"
     print(f"\n=== ready ({mode}) — Ctrl+C to quit ===\n", flush=True)
 
+    try:
+        run_conversation(models, player, history, iter(audio_q.get, None))
+    except KeyboardInterrupt:
+        print("\nbye 👋")
+    finally:
+        save_history(history)
+        in_stream.stop()
+        in_stream.close()
+        player.close()
+        models.stt.close()
+        models.tts.close()
+        models.turn.close()
+    return 0
+
+
+def run_conversation(
+    models: Models,
+    player: TTSPlayer,
+    history: list[dict],
+    frames,
+    state: dict | None = None,
+) -> None:
+    """The turn-taking loop. `frames` yields 10 ms float32 mono chunks at 16 kHz.
+
+    Parameterised on its audio source rather than reading the mic directly, so
+    the loop that owns VAD, barge-in and speculative dispatch can be driven from
+    a file. `learning.md` (2026-07-30) is blunt that this is where the bugs
+    live and that component tests are structurally blind to them; until this was
+    a function, the only way to exercise it was to talk to the thing.
+
+    Returns when `frames` runs out, after any turn still in flight completes.
+    """
     vad_buf = np.zeros(0, dtype=np.float32)  # accumulates AEC'd audio for VAD
     speech_buf: list[np.ndarray] = []
     active = False
     continuations = 0  # times the turn detector deferred the current utterance
     spec_sent = False  # a reply was started before end-of-speech was declared
-    state = {
+    # Passed in by callers that need to observe it — a replay harness has to
+    # know when a turn is in flight so it does not start talking over the reply.
+    # `speaking` covers the whole turn, including the silent stretch between
+    # end-of-speech and the first synthesized frame, which `player.audible`
+    # deliberately does not.
+    state = state if state is not None else {}
+    state.update({
         "speaking": False,
         "resume_at": 0.0,
         "user_just_ended": 0.0,
         "loud_streak": 0,         # consecutive AEC'd frames above the gate
         "barge_fired": False,     # disarms further barge-ins until next reply
-    }
+    })
     llm_cancel = threading.Event()
 
     # cooldown after user finishes speaking, before barge-in can fire on the
@@ -846,6 +885,14 @@ def main() -> int:
                     # sentence we only heard part of.
                     max_tail = int(SR * (models.silence_ms + 400) / 1000)
                     stale = p is not None and len(audio_buf) - len(p.audio) > max_tail
+                    if SPEC_DEBUG:
+                        print(
+                            f"[speculate] commit: pending={p is not None} "
+                            f"cancelled={p.cancel.is_set() if p else '-'} "
+                            f"same_token={(p.cancel is cancel) if p else '-'} "
+                            f"stale={stale}",
+                            flush=True,
+                        )
                     if p is None or p.cancel.is_set() or p.cancel is not cancel or stale:
                         # No usable speculation: none was made, it was aborted,
                         # the mic loop has moved on to a different cancel token
@@ -869,222 +916,224 @@ def main() -> int:
                     state["resume_at"] = time.monotonic() + TTS_TAIL_GRACE_MS / 1000.0
                     state["speaking"] = False
                     models.vad.reset_states()
+                turn_q.task_done()
 
     threading.Thread(target=turn_worker, daemon=True).start()
 
-    try:
-        while True:
-            mic_chunk_f32 = audio_q.get()  # 10 ms float32
+    for mic_chunk_f32 in frames:  # 10 ms float32
+        # In half-duplex fallback, drop mic frames while speaking.
+        if models.apm is None and (
+            state["speaking"] or time.monotonic() < state["resume_at"]
+        ):
+            continue
 
-            # In half-duplex fallback, drop mic frames while speaking.
-            if models.apm is None and (
-                state["speaking"] or time.monotonic() < state["resume_at"]
-            ):
-                continue
+        # AEC: process mic through APM (subtracts speaker echo using reverse stream).
+        if models.apm is not None:
+            mic_i16 = f32_to_i16(mic_chunk_f32)
+            af = AudioFrame(
+                data=mic_i16.tobytes(),
+                sample_rate=SR,
+                num_channels=1,
+                samples_per_channel=APM_FRAME,
+            )
+            models.apm.process_stream(af)
+            cleaned_i16 = np.frombuffer(af.data, dtype=np.int16)
+            cleaned = i16_to_f32(cleaned_i16)
+        else:
+            cleaned = mic_chunk_f32
 
-            # AEC: process mic through APM (subtracts speaker echo using reverse stream).
-            if models.apm is not None:
-                mic_i16 = f32_to_i16(mic_chunk_f32)
-                af = AudioFrame(
-                    data=mic_i16.tobytes(),
-                    sample_rate=SR,
-                    num_channels=1,
-                    samples_per_channel=APM_FRAME,
-                )
-                models.apm.process_stream(af)
-                cleaned_i16 = np.frombuffer(af.data, dtype=np.int16)
-                cleaned = i16_to_f32(cleaned_i16)
+        # Accumulate cleaned audio into 512-sample VAD frames.
+        vad_buf = np.concatenate([vad_buf, cleaned])
+        while len(vad_buf) >= VAD_FRAME:
+            v_chunk = vad_buf[:VAD_FRAME]
+            vad_buf = vad_buf[VAD_FRAME:]
+
+            rms = float(np.sqrt(np.mean(v_chunk**2)))
+
+            # VAD runs before the barge-in check, not after, because the
+            # barge-in decision needs to know whether this frame is speech
+            # at all. Previously it did not: the condition was pure energy
+            # while its comment claimed VAD agreement, and the agent's own
+            # voice leaking past AEC cut 7 of 13 replies in testing.
+            event = models.vad(torch.from_numpy(v_chunk), return_seconds=False)
+            is_speech = bool(getattr(models.vad, "triggered", False))
+
+            # Adaptive gate. Residual echo scales with what the speaker is
+            # actually emitting, so a fixed floor cannot separate "user
+            # talking" from "our own output leaking" — measured false
+            # triggers ranged 0.058-0.152, straddling any single threshold.
+            # Requiring the mic to exceed a multiple of concurrent TTS
+            # output makes the bar rise exactly when leakage does.
+            # `player.audible` rather than "a reply is in flight": synthesis
+            # now runs ahead of the speaker, so those are different
+            # instants, and raising the echo gate before any sound exists
+            # would suppress a real interruption during the silent
+            # pre-audio phase.
+            gate = BARGE_IN_RMS_GATE
+            if player.audible:
+                gate = max(gate, BARGE_IN_ECHO_FACTOR * player.output_rms())
+
+            if rms >= gate and is_speech:
+                state["loud_streak"] += 1
             else:
-                cleaned = mic_chunk_f32
+                state["loud_streak"] = 0
 
-            # Accumulate cleaned audio into 512-sample VAD frames.
-            vad_buf = np.concatenate([vad_buf, cleaned])
-            while len(vad_buf) >= VAD_FRAME:
-                v_chunk = vad_buf[:VAD_FRAME]
-                vad_buf = vad_buf[VAD_FRAME:]
+            # Mid-TTS barge-in. `barge_fired` disarms repeats; we re-arm
+            # when the next reply starts.
+            if (
+                state["speaking"]
+                and player.audible
+                and not state["barge_fired"]
+                and state["loud_streak"] >= BARGE_IN_SUSTAIN_FRAMES
+                and time.monotonic() - state["user_just_ended"] >= POST_USER_BARGE_LOCKOUT_S
+            ):
+                print(
+                    f"[barge-in] cutting reply (rms={rms:.3f} gate={gate:.3f} "
+                    f"streak={state['loud_streak']})",
+                    flush=True,
+                )
+                llm_cancel.set()
+                player.stop()
+                state["loud_streak"] = 0
+                state["barge_fired"] = True
 
-                rms = float(np.sqrt(np.mean(v_chunk**2)))
-
-                # VAD runs before the barge-in check, not after, because the
-                # barge-in decision needs to know whether this frame is speech
-                # at all. Previously it did not: the condition was pure energy
-                # while its comment claimed VAD agreement, and the agent's own
-                # voice leaking past AEC cut 7 of 13 replies in testing.
-                event = models.vad(torch.from_numpy(v_chunk), return_seconds=False)
-                is_speech = bool(getattr(models.vad, "triggered", False))
-
-                # Adaptive gate. Residual echo scales with what the speaker is
-                # actually emitting, so a fixed floor cannot separate "user
-                # talking" from "our own output leaking" — measured false
-                # triggers ranged 0.058-0.152, straddling any single threshold.
-                # Requiring the mic to exceed a multiple of concurrent TTS
-                # output makes the bar rise exactly when leakage does.
-                # `player.audible` rather than "a reply is in flight": synthesis
-                # now runs ahead of the speaker, so those are different
-                # instants, and raising the echo gate before any sound exists
-                # would suppress a real interruption during the silent
-                # pre-audio phase.
-                gate = BARGE_IN_RMS_GATE
-                if player.audible:
-                    gate = max(gate, BARGE_IN_ECHO_FACTOR * player.output_rms())
-
-                if rms >= gate and is_speech:
-                    state["loud_streak"] += 1
-                else:
-                    state["loud_streak"] = 0
-
-                # Mid-TTS barge-in. `barge_fired` disarms repeats; we re-arm
-                # when the next reply starts.
-                if (
-                    state["speaking"]
-                    and player.audible
-                    and not state["barge_fired"]
-                    and state["loud_streak"] >= BARGE_IN_SUSTAIN_FRAMES
-                    and time.monotonic() - state["user_just_ended"] >= POST_USER_BARGE_LOCKOUT_S
+            # ---- speculative dispatch ----
+            # Silero sets `temp_end` the moment speech drops below
+            # threshold and only emits its `end` event once
+            # VAD_MIN_SILENCE_MS has passed since. That interval is dead
+            # time the user is already waiting through, so we spend it on
+            # STT and the model's first token.
+            #
+            # This reads two VADIterator internals. If a future silero
+            # renames them, `spec_silence_ms` stays 0, speculation never
+            # fires, and the pipeline behaves exactly as it did before —
+            # which is the right way to depend on someone else's internals.
+            if SPECULATE and active and not state["speaking"]:
+                temp_end = getattr(models.vad, "temp_end", 0)
+                cur = getattr(models.vad, "current_sample", 0)
+                spec_silence_ms = (cur - temp_end) / SR * 1000.0 if temp_end else 0.0
+                # `is_speech` is what separates "the user started talking again"
+                # from "the utterance just ended": silero clears `temp_end` in
+                # both cases, but only clears `triggered` on the end event.
+                # Without that second term this aborted every speculation one
+                # frame before the commit that would have used it — the guess
+                # was always made and never once reused.
+                if not temp_end and is_speech:
+                    # Speech resumed — either a real continuation or a blip
+                    # that reset the timer. Either way the guess is stale.
+                    if spec_sent:
+                        turn_q.put(("abort",))
+                        llm_cancel.set()
+                        llm_cancel = threading.Event()
+                        spec_sent = False
+                elif (
+                    not spec_sent
+                    and spec_silence_ms >= SPECULATE_AFTER_MS
+                    and speech_buf
                 ):
-                    print(
-                        f"[barge-in] cutting reply (rms={rms:.3f} gate={gate:.3f} "
-                        f"streak={state['loud_streak']})",
-                        flush=True,
-                    )
-                    llm_cancel.set()
-                    player.stop()
-                    state["loud_streak"] = 0
-                    state["barge_fired"] = True
+                    snapshot = np.concatenate(speech_buf)
+                    if len(snapshot) >= MIN_UTTERANCE_SAMPLES:
+                        turn_q.put(("speculate", snapshot, llm_cancel))
+                        spec_sent = True
+                        if SPEC_DEBUG:
+                            print(f"[speculate] {len(snapshot)/SR:.1f}s buffered "
+                                  f"after {spec_silence_ms:.0f}ms silence", flush=True)
 
-                # ---- speculative dispatch ----
-                # Silero sets `temp_end` the moment speech drops below
-                # threshold and only emits its `end` event once
-                # VAD_MIN_SILENCE_MS has passed since. That interval is dead
-                # time the user is already waiting through, so we spend it on
-                # STT and the model's first token.
-                #
-                # This reads two VADIterator internals. If a future silero
-                # renames them, `spec_silence_ms` stays 0, speculation never
-                # fires, and the pipeline behaves exactly as it did before —
-                # which is the right way to depend on someone else's internals.
-                if SPECULATE and active and not state["speaking"]:
-                    temp_end = getattr(models.vad, "temp_end", 0)
-                    cur = getattr(models.vad, "current_sample", 0)
-                    spec_silence_ms = (cur - temp_end) / SR * 1000.0 if temp_end else 0.0
-                    if not temp_end:
-                        # Speech resumed — either a real continuation or a blip
-                        # that reset the timer. Either way the guess is stale.
+            if event:
+                if "start" in event:
+                    if not state["speaking"]:
+                        if active:
+                            # Already mid-utterance: the turn detector told
+                            # us the thought wasn't finished, so this is the
+                            # user resuming after a pause. Keep the buffer —
+                            # resetting it here drops everything said before
+                            # the pause and leaves STT decoding a fragment
+                            # too short to get right.
+                            speech_buf.append(v_chunk)
+                        else:
+                            speech_buf = [v_chunk]
+                            continuations = 0  # fresh utterance
+                            spec_sent = False
+                            print("🎙  listening...", flush=True)
+                        active = True
+                elif "end" in event and active:
+                    speech_buf.append(v_chunk)
+                    audio = np.concatenate(speech_buf)
+
+                    # Sub-word fragments make small STT models hallucinate
+                    # fluent nonsense rather than return nothing — "No.",
+                    # "Thank you." and similar stock phrases. Cheaper to
+                    # refuse to transcribe them than to filter them after.
+                    too_short = len(audio) < MIN_UTTERANCE_SAMPLES
+
+                    # Stop waiting once the utterance hits the ceiling, even
+                    # if the turn detector still thinks there is more coming.
+                    # STT cost scales with buffer length, so an uncapped
+                    # buffer turns into runaway latency.
+                    forced = False
+                    if len(audio) >= MAX_UTTERANCE_SAMPLES:
+                        print(
+                            f"[utterance cap] {len(audio)/SR:.1f}s reached — "
+                            "transcribing now",
+                            flush=True,
+                        )
+                        too_short = False
+                        forced = True
+                    elif continuations >= MAX_TURN_CONTINUATIONS:
+                        print(
+                            f"[turn cap] {continuations} continuations — "
+                            "transcribing now",
+                            flush=True,
+                        )
+                        forced = True
+
+                    # Silero says the sound stopped; the turn detector says
+                    # whether the *thought* finished. If not, stay active so
+                    # the continuation joins this same utterance instead of
+                    # becoming a second, truncated one.
+                    if not forced and (
+                        too_short or not models.turn.is_complete(audio)
+                    ):
+                        continuations += 1
+                        # The utterance is not over, so any reply we started
+                        # is answering a fragment. Drop it and re-arm with a
+                        # fresh token so the eventual real turn is not
+                        # cancelled by this one.
                         if spec_sent:
                             turn_q.put(("abort",))
                             llm_cancel.set()
                             llm_cancel = threading.Event()
                             spec_sent = False
-                    elif (
-                        not spec_sent
-                        and spec_silence_ms >= SPECULATE_AFTER_MS
-                        and speech_buf
-                    ):
-                        snapshot = np.concatenate(speech_buf)
-                        if len(snapshot) >= MIN_UTTERANCE_SAMPLES:
-                            turn_q.put(("speculate", snapshot, llm_cancel))
-                            spec_sent = True
-
-                if event:
-                    if "start" in event:
-                        if not state["speaking"]:
-                            if active:
-                                # Already mid-utterance: the turn detector told
-                                # us the thought wasn't finished, so this is the
-                                # user resuming after a pause. Keep the buffer —
-                                # resetting it here drops everything said before
-                                # the pause and leaves STT decoding a fragment
-                                # too short to get right.
-                                speech_buf.append(v_chunk)
-                            else:
-                                speech_buf = [v_chunk]
-                                continuations = 0  # fresh utterance
-                                spec_sent = False
-                                print("🎙  listening...", flush=True)
-                            active = True
-                    elif "end" in event and active:
-                        speech_buf.append(v_chunk)
-                        audio = np.concatenate(speech_buf)
-
-                        # Sub-word fragments make small STT models hallucinate
-                        # fluent nonsense rather than return nothing — "No.",
-                        # "Thank you." and similar stock phrases. Cheaper to
-                        # refuse to transcribe them than to filter them after.
-                        too_short = len(audio) < MIN_UTTERANCE_SAMPLES
-
-                        # Stop waiting once the utterance hits the ceiling, even
-                        # if the turn detector still thinks there is more coming.
-                        # STT cost scales with buffer length, so an uncapped
-                        # buffer turns into runaway latency.
-                        forced = False
-                        if len(audio) >= MAX_UTTERANCE_SAMPLES:
-                            print(
-                                f"[utterance cap] {len(audio)/SR:.1f}s reached — "
-                                "transcribing now",
-                                flush=True,
-                            )
-                            too_short = False
-                            forced = True
-                        elif continuations >= MAX_TURN_CONTINUATIONS:
-                            print(
-                                f"[turn cap] {continuations} continuations — "
-                                "transcribing now",
-                                flush=True,
-                            )
-                            forced = True
-
-                        # Silero says the sound stopped; the turn detector says
-                        # whether the *thought* finished. If not, stay active so
-                        # the continuation joins this same utterance instead of
-                        # becoming a second, truncated one.
-                        if not forced and (
-                            too_short or not models.turn.is_complete(audio)
-                        ):
-                            continuations += 1
-                            # The utterance is not over, so any reply we started
-                            # is answering a fragment. Drop it and re-arm with a
-                            # fresh token so the eventual real turn is not
-                            # cancelled by this one.
-                            if spec_sent:
-                                turn_q.put(("abort",))
-                                llm_cancel.set()
-                                llm_cancel = threading.Event()
-                                spec_sent = False
-                            models.vad.reset_states()
-                            continue
-
-                        active = False
-                        continuations = 0
-                        state["speaking"] = True
-                        state["user_just_ended"] = time.monotonic()
-                        state["loud_streak"] = 0
-                        state["barge_fired"] = False  # re-arm for the new reply
-                        # Keep the existing token when a speculation is live —
-                        # it is the one the worker is already generating
-                        # against, and swapping it here would leave barge-in
-                        # holding an event nothing is listening to.
-                        if not spec_sent:
-                            llm_cancel = threading.Event()
-                        spec_sent = False
-                        # Stamp end-of-speech here, not in the worker: the queue
-                        # hop and any backlog are latency the user experiences,
-                        # and starting the clock inside respond() would hide it.
-                        turn_q.put(("commit", audio, llm_cancel, time.perf_counter()))
                         models.vad.reset_states()
-                elif active:
-                    speech_buf.append(v_chunk)
+                        continue
 
-    except KeyboardInterrupt:
-        print("\nbye 👋")
-    finally:
-        save_history(history)
-        in_stream.stop()
-        in_stream.close()
-        player.close()
-        models.stt.close()
-        models.tts.close()
-        models.turn.close()
-    return 0
+                    active = False
+                    continuations = 0
+                    state["speaking"] = True
+                    state["user_just_ended"] = time.monotonic()
+                    state["loud_streak"] = 0
+                    state["barge_fired"] = False  # re-arm for the new reply
+                    # Keep the existing token when a speculation is live —
+                    # it is the one the worker is already generating
+                    # against, and swapping it here would leave barge-in
+                    # holding an event nothing is listening to.
+                    if not spec_sent:
+                        llm_cancel = threading.Event()
+                    spec_sent = False
+                    # Stamp end-of-speech here, not in the worker: the queue
+                    # hop and any backlog are latency the user experiences,
+                    # and starting the clock inside respond() would hide it.
+                    turn_q.put(("commit", audio, llm_cancel, time.perf_counter()))
+                    models.vad.reset_states()
+            elif active:
+                speech_buf.append(v_chunk)
+
+    # Only reached when the frame source runs out, which the mic never does.
+    # A finite source (a test, a recording) has to wait for the last turn to
+    # finish speaking, or it measures a reply that was cut off by the file
+    # ending rather than by anything real.
+    turn_q.join()
+    player.wait_idle()
 
 
 @dataclass

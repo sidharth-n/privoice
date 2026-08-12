@@ -125,7 +125,12 @@ def report(rows: list[dict]) -> None:
             parts = [t.get("dispatch_ms"), t.get("stt_ms"),
                      t.get("llm_first_sentence_ms"), t.get("tts_first_ms")]
             if all(p is not None for p in parts):
-                gaps.append(t["first_audio_ms"] - sum(parts))
+                # Minus any work done before the clock started, or every
+                # speculated turn reads as hundreds of unattributed
+                # milliseconds when in fact it is simply further ahead.
+                gaps.append(
+                    t["first_audio_ms"] - sum(parts) + (t.get("spec_lead_ms") or 0.0)
+                )
         if gaps:
             med = statistics.median(gaps)
             flag = "  ← unattributed, worth chasing" if abs(med) > 50 else ""
