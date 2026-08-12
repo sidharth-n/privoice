@@ -1,10 +1,27 @@
-# uncensored-local-voice
+# venice-voice-agent
 
-A fully local, fully uncensored, real-time voice agent. Mic in → spoken reply out. No cloud, no safety filters.
+A real-time voice agent. Mic in → spoken reply out. Every slot (STT, LLM, TTS)
+runs either on-device or on Venice's hosted API, selected by env var. Forked
+2026-08-12 from `uncensored-local-voice`, which was local-only.
 
-**Measured latency (2026-07-30, this M5):** ~1.6 s isolated, 2.2–3.6 s time-to-first-audio in
-live conversation. The original "<1 s warm" claim was never met — see `issues/0003`, the LLM's
-first-sentence time is the dominant cost.
+**Measured latency (2026-08-12, this M5, 5 samples/slot — see `docs/BENCHMARK.md`):**
+all-local 1,642 ms · all-Venice 3,672 ms · **hybrid (local STT/TTS + Venice LLM)
+1,381 ms**. Cold start, which is the realistic first turn: local 7,824 ms vs
+hybrid 1,381 ms.
+
+The original "<1 s warm" claim from the local build was never met — see
+`issues/0003`. The LLM's **first-sentence** time is the dominant cost, and
+time-to-first-token is not a proxy for it.
+
+**Working rules for this repo:**
+- The local path is the default and must stay working. Hosted slots are additive.
+- Never quote the LLM row as like-for-like: local 26B Q4 GGUF and
+  `venice-uncensored` are different models on different hardware. STT and TTS
+  *are* like-for-like (Venice serves the same Parakeet and Kokoro checkpoints).
+- Benchmarks warm up and discard the first sample. If you report a cold number,
+  label it cold — the two differ by ~6× on the local LLM.
+- `venice_parameters.include_venice_system_prompt` stays `false`; leaving it on
+  adds ~1,568 cached prompt tokens and silently changes the workload.
 
 ## Pipeline
 
