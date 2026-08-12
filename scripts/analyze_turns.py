@@ -155,6 +155,17 @@ def report(rows: list[dict]) -> None:
                 print(f"  gap before later sentences, pre-split rows (issues/0002): "
                       f"median {statistics.median(legacy):.0f}ms over {len(legacy)} sentences")
 
+        # Speculative dispatch only pays off when the guess survives to be
+        # used, and the hit rate is the thing to watch: every miss is a hosted
+        # call bought and thrown away. A row that was never speculated and one
+        # whose speculation was discarded both log 0, so this counts turns that
+        # actually collected a lead.
+        leads = [t.get("spec_lead_ms") or 0.0 for t in spoke]
+        used = [x for x in leads if x > 1]
+        if used:
+            print(f"  speculation     {len(used)}/{len(leads)} turns started early, "
+                  f"median lead {statistics.median(used):.0f}ms")
+
         cut = sum(1 for t in turns if t.get("interrupted"))
         if cut:
             print(f"  barge-ins: {cut} of {len(turns)} turns cut short")

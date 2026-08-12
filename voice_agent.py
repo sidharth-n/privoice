@@ -126,16 +126,49 @@ MAX_TURN_CONTINUATIONS = int(os.environ.get("MAX_TURN_CONTINUATIONS", "2"))
 MIN_UTTERANCE_MS = int(os.environ.get("MIN_UTTERANCE_MS", "250"))
 MIN_UTTERANCE_SAMPLES = SR * MIN_UTTERANCE_MS // 1000
 
+# Speculative dispatch. Silero only reports end-of-speech after
+# VAD_MIN_SILENCE_MS of silence has already gone by, so that window is dead
+# time the user is already waiting through — it does not even appear in
+# `first_audio_ms`, which starts when Silero *reports* the end. Starting STT and
+# the model's first token that many milliseconds early takes the work off the
+# front of the wait instead of leaving it behind a timer.
+#
+# The trade is a wasted hosted-LLM call whenever someone pauses this long and
+# then keeps talking. 200 ms is late enough that ordinary mid-sentence breaths
+# do not trigger it and early enough to buy back most of the window; the lead is
+# VAD_MIN_SILENCE_MS - SPECULATE_AFTER_MS. Set SPECULATE=0 to turn it off and
+# get exactly the previous behaviour.
+SPECULATE = os.environ.get("SPECULATE", "1") == "1"
+SPECULATE_AFTER_MS = int(os.environ.get("SPECULATE_AFTER_MS", "200"))
+
 HISTORY_FILE = Path(__file__).resolve().parent / ".voice_history.json"
 HISTORY_MAX_TURNS = int(os.environ.get("HISTORY_MAX_TURNS", "8"))
 
+# The first sentence is the whole latency story, so the prompt is a latency
+# control as much as a persona (`issues/0010`). Kokoro emits no audio until it
+# has synthesized an entire sentence, and time-to-first-audio tracks that
+# sentence's length at ~7.9 ms/character — so the model's choice of opening
+# phrase moves felt latency more than swapping local TTS for hosted does.
+#
+# The old wording ("Reply in 1 short sentence, sometimes 2") constrained the
+# *reply* and left the opener free: measured median 46 characters, p90 108,
+# max 142. Naming the first sentence specifically gives median 19, p90 31,
+# max 35 — projected time-to-first-audio 481 ms -> 268 ms, and the long tail
+# that produced the old p90 disappears entirely.
+#
+# "Put every detail in the sentences after it" is only affordable because
+# synthesis now runs ahead of playback (`issues/0002`): later sentences are
+# built underneath the audio already playing, so their length is free. Before
+# that change this instruction would have moved the cost rather than removed it.
 SYSTEM_PROMPT = (
-    "You are a friend on a voice call. Reply in 1 short sentence, sometimes 2. "
-    "Talk like a person, not a chatbot — use contractions, casual phrasing, and "
-    "the kind of fillers a human uses ('hmm', 'yeah', 'oh'). "
-    "Never use bullet points, lists, code, or markdown. "
-    "Never say 'as an AI' or add safety disclaimers. No em-dashes. "
-    "If something is complex, give the gist in one breath and offer to dig in."
+    "You are a friend on a voice call. "
+    "Your FIRST sentence must be under 8 words — a reaction, not the answer. "
+    "Put every detail in the sentences after it. "
+    "Keep the whole reply under 3 sentences. "
+    "Talk like a person, not a chatbot: contractions, casual phrasing, fillers "
+    "('hmm', 'yeah', 'oh'). "
+    "No bullet points, lists, code, markdown, em-dashes. "
+    "Never say 'as an AI' and never add safety disclaimers."
 )
 
 SENT_END = re.compile(r"[.!?](?:\s|$)|\n")
@@ -278,11 +311,22 @@ class LlmStreamer:
         threading.Thread(target=self._run, daemon=True, name="llm-drain").start()
 
     def stream(self, history, client, cancel, stats, origin):
-        """Yield tokens that are already being fetched, not fetched on demand."""
+        """Start fetching now; return an iterator over what arrives.
+
+        Deliberately not a generator function. A generator's body does not run
+        until it is first advanced, so the request would not leave the machine
+        until someone pulled a token — which defeats the entire point here, and
+        would make speculative dispatch (starting a reply before the user's
+        turn is declared over) do nothing at all.
+        """
         out: queue.Queue = queue.Queue()
-        # Copy the history: `respond()` appends to it as soon as the reply
+        # Copy the history: the caller appends to it as soon as the reply
         # lands, and the producer is reading it on another thread.
         self._jobs.put((list(history), client, cancel, stats, origin, out))
+        return self._drain(out)
+
+    @staticmethod
+    def _drain(out: queue.Queue):
         while True:
             item = out.get()
             if item is _STREAM_END:
@@ -377,6 +421,7 @@ class Models:
     apm: AudioProcessingModule | None
     client: httpx.Client
     llm: LlmStreamer
+    silence_ms: int   # VAD end-of-speech timeout; the window speculation eats into
 
 
 def load_models() -> Models:
@@ -442,7 +487,7 @@ def load_models() -> Models:
     client = httpx.Client(timeout=httpx.Timeout(120.0))
     return Models(
         vad=vad, stt=stt, tts=tts, turn=turn, apm=apm, client=client,
-        llm=LlmStreamer(),
+        llm=LlmStreamer(), silence_ms=min_silence_ms,
     )
 
 
@@ -744,6 +789,7 @@ def main() -> int:
     speech_buf: list[np.ndarray] = []
     active = False
     continuations = 0  # times the turn detector deferred the current utterance
+    spec_sent = False  # a reply was started before end-of-speech was declared
     state = {
         "speaking": False,
         "resume_at": 0.0,
@@ -769,16 +815,60 @@ def main() -> int:
     turn_q: queue.Queue = queue.Queue()
 
     def turn_worker():
+        # A reply started during the silence window, waiting to be confirmed or
+        # thrown away. Held here rather than in the mic loop because it is the
+        # worker that owns STT and must not be asked about it from two threads.
+        pending: PendingReply | None = None
+
         while True:  # never returns — exiting is precisely what crashes
-            audio_buf, cancel, t_end = turn_q.get()
+            msg = turn_q.get()
+            kind = msg[0]
             try:
-                respond(audio_buf, models, history, player, cancel, t_end)
+                if kind == "speculate":
+                    _, audio_buf, cancel = msg
+                    if pending is not None:
+                        pending.cancel.set()
+                    pending = start_reply(audio_buf, models, history, cancel)
+
+                elif kind == "abort":
+                    # The user carried on talking, so whatever we guessed at is
+                    # answering half a sentence. Drop it and stop the generation.
+                    if pending is not None:
+                        pending.cancel.set()
+                        pending = None
+
+                elif kind == "commit":
+                    _, audio_buf, cancel, t_end = msg
+                    p, pending = pending, None
+                    # Anything past the silence timeout plus slack means audio
+                    # arrived that the speculative transcript never saw — a
+                    # forced cap mid-pause, say. Redo rather than answer a
+                    # sentence we only heard part of.
+                    max_tail = int(SR * (models.silence_ms + 400) / 1000)
+                    stale = p is not None and len(audio_buf) - len(p.audio) > max_tail
+                    if p is None or p.cancel.is_set() or p.cancel is not cancel or stale:
+                        # No usable speculation: none was made, it was aborted,
+                        # the mic loop has moved on to a different cancel token
+                        # so this one would never reach it, or the buffer grew.
+                        if p is not None:
+                            p.cancel.set()
+                        p = start_reply(audio_buf, models, history, cancel)
+                    else:
+                        # Reuse it, but answer against the full utterance: the
+                        # tail of trailing silence is not new speech, and the
+                        # transcript is the same. Keep the longer buffer so the
+                        # logged audio_in_s is what was actually captured.
+                        p.audio = audio_buf
+                    speak_reply(p, models, history, player, cancel, t_end)
+
             except Exception as e:  # one bad turn must not kill the worker
                 print(f"\n[turn failed] {type(e).__name__}: {e}", flush=True)
+                pending = None
             finally:
-                state["resume_at"] = time.monotonic() + TTS_TAIL_GRACE_MS / 1000.0
-                state["speaking"] = False
-                models.vad.reset_states()
+                if kind == "commit":
+                    state["resume_at"] = time.monotonic() + TTS_TAIL_GRACE_MS / 1000.0
+                    state["speaking"] = False
+                    models.vad.reset_states()
 
     threading.Thread(target=turn_worker, daemon=True).start()
 
@@ -862,6 +952,39 @@ def main() -> int:
                     state["loud_streak"] = 0
                     state["barge_fired"] = True
 
+                # ---- speculative dispatch ----
+                # Silero sets `temp_end` the moment speech drops below
+                # threshold and only emits its `end` event once
+                # VAD_MIN_SILENCE_MS has passed since. That interval is dead
+                # time the user is already waiting through, so we spend it on
+                # STT and the model's first token.
+                #
+                # This reads two VADIterator internals. If a future silero
+                # renames them, `spec_silence_ms` stays 0, speculation never
+                # fires, and the pipeline behaves exactly as it did before —
+                # which is the right way to depend on someone else's internals.
+                if SPECULATE and active and not state["speaking"]:
+                    temp_end = getattr(models.vad, "temp_end", 0)
+                    cur = getattr(models.vad, "current_sample", 0)
+                    spec_silence_ms = (cur - temp_end) / SR * 1000.0 if temp_end else 0.0
+                    if not temp_end:
+                        # Speech resumed — either a real continuation or a blip
+                        # that reset the timer. Either way the guess is stale.
+                        if spec_sent:
+                            turn_q.put(("abort",))
+                            llm_cancel.set()
+                            llm_cancel = threading.Event()
+                            spec_sent = False
+                    elif (
+                        not spec_sent
+                        and spec_silence_ms >= SPECULATE_AFTER_MS
+                        and speech_buf
+                    ):
+                        snapshot = np.concatenate(speech_buf)
+                        if len(snapshot) >= MIN_UTTERANCE_SAMPLES:
+                            turn_q.put(("speculate", snapshot, llm_cancel))
+                            spec_sent = True
+
                 if event:
                     if "start" in event:
                         if not state["speaking"]:
@@ -876,6 +999,7 @@ def main() -> int:
                             else:
                                 speech_buf = [v_chunk]
                                 continuations = 0  # fresh utterance
+                                spec_sent = False
                                 print("🎙  listening...", flush=True)
                             active = True
                     elif "end" in event and active:
@@ -917,6 +1041,15 @@ def main() -> int:
                             too_short or not models.turn.is_complete(audio)
                         ):
                             continuations += 1
+                            # The utterance is not over, so any reply we started
+                            # is answering a fragment. Drop it and re-arm with a
+                            # fresh token so the eventual real turn is not
+                            # cancelled by this one.
+                            if spec_sent:
+                                turn_q.put(("abort",))
+                                llm_cancel.set()
+                                llm_cancel = threading.Event()
+                                spec_sent = False
                             models.vad.reset_states()
                             continue
 
@@ -926,11 +1059,17 @@ def main() -> int:
                         state["user_just_ended"] = time.monotonic()
                         state["loud_streak"] = 0
                         state["barge_fired"] = False  # re-arm for the new reply
-                        llm_cancel = threading.Event()
+                        # Keep the existing token when a speculation is live —
+                        # it is the one the worker is already generating
+                        # against, and swapping it here would leave barge-in
+                        # holding an event nothing is listening to.
+                        if not spec_sent:
+                            llm_cancel = threading.Event()
+                        spec_sent = False
                         # Stamp end-of-speech here, not in the worker: the queue
                         # hop and any backlog are latency the user experiences,
                         # and starting the clock inside respond() would hide it.
-                        turn_q.put((audio, llm_cancel, time.perf_counter()))
+                        turn_q.put(("commit", audio, llm_cancel, time.perf_counter()))
                         models.vad.reset_states()
                 elif active:
                     speech_buf.append(v_chunk)
@@ -948,8 +1087,85 @@ def main() -> int:
     return 0
 
 
+@dataclass
+class PendingReply:
+    """A reply whose STT and LLM call have already been started.
+
+    Exists so the expensive half of a turn can begin during Silero's
+    end-of-speech confirmation window instead of after it — see
+    `start_reply()`. On the ordinary path it is created and consumed
+    microseconds apart and changes nothing.
+    """
+
+    audio: np.ndarray
+    user_text: str
+    stt_ms: float
+    t_started: float                 # perf_counter when STT began
+    t_llm_start: float
+    tokens: object | None            # iterator of token deltas, already draining
+    stats: dict
+    cancel: threading.Event
+    prompt: list[dict]               # what we actually sent, history untouched
+
+
+def start_reply(
+    audio: np.ndarray,
+    models: Models,
+    history: list[dict],
+    cancel: threading.Event,
+) -> PendingReply:
+    """Transcribe and start generating. Speaks nothing, mutates no history.
+
+    History is deliberately left alone: a speculative reply may be thrown away
+    when the user turns out to have only paused, and a turn that never happened
+    must not appear in the conversation the model sees. The prompt is built
+    locally and only committed by `speak_reply()`.
+    """
+    t_started = time.perf_counter()
+    user_text = transcribe_utterance(models.stt, audio)
+    stt_ms = (time.perf_counter() - t_started) * 1000.0
+
+    prompt: list[dict] = []
+    tokens = None
+    stats = {"ttft": None, "chunks": 0, "last": None}
+    t_llm_start = time.perf_counter()
+    if user_text:
+        prompt = trim_history(history + [{"role": "user", "content": user_text}])
+        # `stats` counts stream *deltas*, not tokenizer tokens — Ollama and
+        # Venice both emit one delta per token in practice, but nothing
+        # guarantees it, so the field is `chunks` and not `tokens`.
+        tokens = models.llm.stream(prompt, models.client, cancel, stats, t_llm_start)
+    return PendingReply(
+        audio=audio,
+        user_text=user_text,
+        stt_ms=stt_ms,
+        t_started=t_started,
+        t_llm_start=t_llm_start,
+        tokens=tokens,
+        stats=stats,
+        cancel=cancel,
+        prompt=prompt,
+    )
+
+
 def respond(
     audio: np.ndarray,
+    models: Models,
+    history: list[dict],
+    player: TTSPlayer,
+    cancel: threading.Event,
+    speech_end: float | None = None,
+) -> None:
+    """Run a whole turn now. The unspeculated path, and what the tests drive."""
+    t_end = speech_end if speech_end is not None else time.perf_counter()
+    speak_reply(
+        start_reply(audio, models, history, cancel),
+        models, history, player, cancel, t_end,
+    )
+
+
+def speak_reply(
+    pending: PendingReply,
     models: Models,
     history: list[dict],
     player: TTSPlayer,
@@ -960,6 +1176,7 @@ def respond(
     # human starts waiting. `speech_end` is stamped in the mic loop; falling
     # back to now() only loses the queue hop when a caller omits it.
     t_end = speech_end if speech_end is not None else time.perf_counter()
+    audio = pending.audio
 
     m = TurnMetrics(
         llm_backend=LLM_BACKEND,
@@ -967,13 +1184,16 @@ def respond(
         stt_engine=models.stt.name,
         tts_engine=models.tts.name,
         audio_in_s=len(audio) / SR,
-        dispatch_ms=(time.perf_counter() - t_end) * 1000.0,
+        # Work that began before end-of-speech was declared. On the ordinary
+        # path one of these is zero and the other is the queue hop; under
+        # speculation the lead is how much of the turn was already done by the
+        # time the user's wait officially started.
+        dispatch_ms=max(0.0, (pending.t_started - t_end) * 1000.0),
+        spec_lead_ms=max(0.0, (t_end - pending.t_started) * 1000.0),
     )
 
-    t0 = time.perf_counter()
-    user_text = transcribe_utterance(models.stt, audio)
-    t_stt = time.perf_counter() - t0
-    m.stt_ms = t_stt * 1000.0
+    user_text = pending.user_text
+    m.stt_ms = pending.stt_ms
     if not user_text:
         print("(no speech detected)", flush=True)
         # Still logged: a turn that cost STT time and produced nothing is a
@@ -990,25 +1210,25 @@ def respond(
     # audio", and those have opposite fixes.
     print(
         f"You: {user_text}   "
-        f"[stt {t_stt*1000:.0f}ms on {len(audio)/SR:.1f}s]",
+        f"[stt {pending.stt_ms:.0f}ms on {len(audio)/SR:.1f}s"
+        + (f", {m.spec_lead_ms:.0f}ms early" if m.spec_lead_ms > 1 else "")
+        + "]",
         flush=True,
     )
 
+    # Committed only now: until this point the reply might have been discarded.
     history.append({"role": "user", "content": user_text})
     history[:] = trim_history(history)
 
     print("AI: ", end="", flush=True)
-    t1 = time.perf_counter()
-    llm_stats = {"ttft": None, "chunks": 0, "last": None}
+    t1 = pending.t_llm_start
+    llm_stats = pending.stats
 
     interrupted = False
     metas: list[dict] = []
     player.begin_reply()
     try:
-        # `llm_stats` counts stream *deltas*, not tokenizer tokens — Ollama and
-        # Venice both emit one delta per token in practice, but nothing
-        # guarantees it, so the field is `chunks` and not `tokens`.
-        tokens = models.llm.stream(history, models.client, cancel, llm_stats, t1)
+        tokens = pending.tokens
         for sent in sentence_stream(tokens):
             if cancel.is_set():
                 interrupted = True

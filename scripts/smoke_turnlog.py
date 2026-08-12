@@ -170,18 +170,26 @@ def verify(n_turns: int) -> int:
         if missing:
             failures.append(f"turn {i}: missing stage(s) {missing}")
             continue
-        gap = fa - sum(parts.values())
+        # Work done before end-of-speech was declared does not count towards the
+        # wait, so it comes back off the sum. It is 0 unless the turn was
+        # speculated; leaving it out would make every speculated turn read as
+        # broken arithmetic rather than as a faster turn.
+        lead = r.get("spec_lead_ms") or 0.0
+        expected = sum(parts.values()) - lead
+        gap = fa - expected
         # The stages are measured on the same clock and cover the whole path,
         # so they must sum to first-audio. A drift beyond a few frames means a
         # stage is being double-counted or one is unmeasured.
         status = "ok" if abs(gap) < 100 else "DRIFT"
         if status == "DRIFT":
-            failures.append(f"turn {i}: stages sum to {sum(parts.values()):.0f}ms "
+            failures.append(f"turn {i}: stages sum to {expected:.0f}ms "
                             f"but first audio was {fa:.0f}ms (gap {gap:+.0f}ms)")
         print(f"  turn {i}: first-audio {fa:>6.0f}ms = "
               f"dispatch {parts['dispatch_ms']:.0f} + stt {parts['stt_ms']:.0f} + "
               f"llm {parts['llm_first_sentence_ms']:.0f} + "
-              f"tts {parts['tts_first_ms']:.0f}  [{status}]")
+              f"tts {parts['tts_first_ms']:.0f}"
+              + (f" - {lead:.0f} early" if lead > 1 else "")
+              + f"  [{status}]")
         for f in ("llm_chunks", "llm_chunk_s", "tts_rtf", "tts_audio_s", "turn_total_ms"):
             if r.get(f) in (None, 0):
                 failures.append(f"turn {i}: {f} is {r.get(f)!r}")

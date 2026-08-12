@@ -65,6 +65,12 @@ class TurnMetrics:
 
     # stages
     dispatch_ms: float = 0.0            # end-of-speech -> worker picked the turn up
+    # Work already done when end-of-speech was declared. Silero only reports the
+    # end of an utterance after a fixed silence timeout has elapsed, so that
+    # window is dead time the pipeline can spend on STT and on the model's first
+    # token. When it does, the stages no longer sum to first-audio — they sum to
+    # first-audio *plus* this. 0 on the unspeculated path.
+    spec_lead_ms: float = 0.0
     stt_ms: float = 0.0
     llm_ttft_ms: float | None = None    # first token out of the model
     llm_first_sentence_ms: float | None = None   # first sentence handed to TTS
@@ -116,17 +122,22 @@ def summary_line(m: TurnMetrics) -> str:
     """The one-line terminal readout for a finished turn.
 
     Deliberately prints every stage on the critical path to first audio, and
-    prints them as a sum that reconciles: stt + llm-first-sentence + tts-first
-    should equal first_audio. When it doesn't, the missing milliseconds are
-    real and worth chasing.
+    prints them as a sum that reconciles:
+
+        dispatch + stt + llm-first-sentence + tts-first - spec_lead == first_audio
+
+    When it doesn't, the missing milliseconds are real and worth chasing. The
+    `spec_lead` term is what a turn got done before the clock started; without
+    it a speculated turn looks like it broke the arithmetic.
     """
     def ms(v: float | None) -> str:
         return "—" if v is None else f"{v:.0f}"
 
+    lead = f" - {ms(m.spec_lead_ms)} early" if m.spec_lead_ms > 1 else ""
     parts = [
         f"[turn] first-audio {ms(m.first_audio_ms)}ms "
         f"= stt {ms(m.stt_ms)} + llm {ms(m.llm_first_sentence_ms)} "
-        f"+ tts {ms(m.tts_first_ms)}",
+        f"+ tts {ms(m.tts_first_ms)}{lead}",
         f"ttft {ms(m.llm_ttft_ms)}ms · {m.llm_chunks} chunks"
         + (f" @ {m.llm_chunk_s:.1f}/s" if m.llm_chunk_s else ""),
     ]
