@@ -1,5 +1,24 @@
 # Privoice
 
+**A private, uncensored voice agent. No refusal layer, no logging, no retention.**
+
+Talk to it and it talks back in about a second and a half, full duplex — cut it
+off mid-sentence and it stops. It answers what other assistants refuse, and it
+keeps no record that you asked.
+
+```bash
+git clone https://github.com/sidharth-n/privoice && cd privoice
+uv sync
+cp .env.example .env                        # add a Venice key for the hosted slots
+LLM_BACKEND=venice uv run python voice_agent.py
+```
+
+Everything below is the measurement behind those claims. Every figure came off
+one machine, is labelled as warm or cold, and is reproducible with the scripts
+in this repo — nothing here is quoted from a vendor blog.
+
+---
+
 A real-time voice agent for Apple Silicon whose every slot — speech-to-text,
 LLM, text-to-speech — swaps by env var between **on-device** and
 **[Venice AI](https://venice.ai)'s hosted API**. Speak to it, it speaks back,
