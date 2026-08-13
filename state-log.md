@@ -1,5 +1,54 @@
 # Session log (older handoffs, newest first)
 
+## 2026-08-12 — Privoice launch prep (rename, public repo, launch video)
+
+**Shipped this session, in order:**
+
+1. **Renamed the project.** `venice-voice-agent` → `privoice`: GitHub repo via
+   `gh repo rename` (old URL redirects), local directory moved, every internal
+   reference rewritten, `uv.lock` regenerated so the package name follows.
+   Display casing is "Privoice" in prose, `privoice` for repo/dir/package.
+   External references in `Work/video-engine/apps/privoice` repointed too — its
+   VO generator had the agent path hardcoded. Registered in the brain as a **new**
+   card (`brain/projects/privoice.md`), not a rename: `uncensored-local-voice`
+   still exists as its own project.
+
+2. **Made the repo public** after scanning history for secrets (clean), with
+   description and topics. README rewritten to lead with the product and a
+   runnable quick-start, measurement intact underneath.
+
+3. **Built the launch video** as a new `video-engine` tenant
+   (`Work/video-engine/apps/privoice/`, brief `0001-launch.md`). Six scenes:
+   recorded cold-open exchange → wordmark → spec checklist → terminal with real
+   `turn_log.jsonl` rows → three claims that erase themselves → repo + Venice
+   lockup. Palette scraped from live venice.ai markup. Music bed picked by
+   measurement (spectral centroid, BPM, beat-autocorrelation "pulse") across 32
+   candidates; `mixkit-609` chosen. Per-bed `BGM_GAIN`, because a sub-heavy bed
+   and a mid-bright one cannot share one number.
+
+4. **Found and worked around a real TTS defect** (see Next #3) — the most
+   reusable finding of the session; written up in `learning.md`.
+
+**Decisions that will look arbitrary later:**
+
+- `"Pre-voice"` in the VO script is a **pronunciation control, not a typo**.
+  espeak maps the real spelling to `pɹˈɪvYs` ("PRIV-oyss"), which Sid heard as
+  "prevaice"; the hyphenated form maps to `pɹˌivˈYs` ("pree-VOICE"). Do not
+  "correct" it.
+- The silence between question and reply in the video's cold open is **38 frames
+  = 1,272 ms**, a real measured turn, with a counter running through it. Cutting
+  it shorter would have been trivial and would have been the one lie the film
+  argues against.
+- Every number in the video's terminal scene is a real row from
+  `turn_log.jsonl`, per video-engine's honest-content rule.
+
+**Start next session by** asking whether the post went out and who the Telegram
+recipient is. If the launch is done, Next #3 (the TTS bug) is the highest-value
+code work and has a working reference implementation to copy.
+
+---
+
+
 ## 2026-08-12 — Venice port, then per-turn instrumentation
 
 _Rolled down by `/end` on 2026-08-12 when the session turned to the Privoice launch._
@@ -287,51 +336,3 @@ see `issues/0005`. Do not develop turn-taking by shipping to Sid and reading log
 - Persistent context memory: `.voice_history.json` saves user/assistant turns; rolling-window trim. Each session resumes prior turns automatically.
 - Live conversation tested for ~30 turns: real barge-ins fire correctly (RMS 0.07–0.15, sustained), Malayalam reply played through cleanly, conversational personality good ("Hmm", "Haha", contractions, no disclaimers).
 - Wrote `CLAUDE.md` with full architecture, run instructions, env-var reference, and gotchas.
-
----
-
-## Handoff — 2026-08-12 (Privoice launch prep)
-
-**Shipped this session, in order:**
-
-1. **Renamed the project.** `venice-voice-agent` → `privoice`: GitHub repo via
-   `gh repo rename` (old URL redirects), local directory moved, every internal
-   reference rewritten, `uv.lock` regenerated so the package name follows.
-   Display casing is "Privoice" in prose, `privoice` for repo/dir/package.
-   External references in `Work/video-engine/apps/privoice` repointed too — its
-   VO generator had the agent path hardcoded. Registered in the brain as a **new**
-   card (`brain/projects/privoice.md`), not a rename: `uncensored-local-voice`
-   still exists as its own project.
-
-2. **Made the repo public** after scanning history for secrets (clean), with
-   description and topics. README rewritten to lead with the product and a
-   runnable quick-start, measurement intact underneath.
-
-3. **Built the launch video** as a new `video-engine` tenant
-   (`Work/video-engine/apps/privoice/`, brief `0001-launch.md`). Six scenes:
-   recorded cold-open exchange → wordmark → spec checklist → terminal with real
-   `turn_log.jsonl` rows → three claims that erase themselves → repo + Venice
-   lockup. Palette scraped from live venice.ai markup. Music bed picked by
-   measurement (spectral centroid, BPM, beat-autocorrelation "pulse") across 32
-   candidates; `mixkit-609` chosen. Per-bed `BGM_GAIN`, because a sub-heavy bed
-   and a mid-bright one cannot share one number.
-
-4. **Found and worked around a real TTS defect** (see Next #3) — the most
-   reusable finding of the session; written up in `learning.md`.
-
-**Decisions that will look arbitrary later:**
-
-- `"Pre-voice"` in the VO script is a **pronunciation control, not a typo**.
-  espeak maps the real spelling to `pɹˈɪvYs` ("PRIV-oyss"), which Sid heard as
-  "prevaice"; the hyphenated form maps to `pɹˌivˈYs` ("pree-VOICE"). Do not
-  "correct" it.
-- The silence between question and reply in the video's cold open is **38 frames
-  = 1,272 ms**, a real measured turn, with a counter running through it. Cutting
-  it shorter would have been trivial and would have been the one lie the film
-  argues against.
-- Every number in the video's terminal scene is a real row from
-  `turn_log.jsonl`, per video-engine's honest-content rule.
-
-**Start next session by** asking whether the post went out and who the Telegram
-recipient is. If the launch is done, Next #3 (the TTS bug) is the highest-value
-code work and has a working reference implementation to copy.

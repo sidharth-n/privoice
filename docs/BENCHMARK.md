@@ -289,6 +289,21 @@ carries the table. What moved instead:
    model's first token now run inside it, and the guess is discarded if the user
    turns out to have only paused. Median 342 ms recovered, on 20 of 20 turns.
 
+### The rows behind these numbers
+
+Committed, so every figure above can be recomputed rather than taken on trust:
+
+```bash
+uv run python scripts/analyze_turns.py --log replay_2026-08-12_spec_on.jsonl   # 20 turns
+uv run python scripts/analyze_turns.py --log replay_2026-08-12_spec_off.jsonl  # 10, control
+```
+
+These are tracked even though `turn_log.jsonl` is gitignored, and the reason is
+the difference between them: the gitignored log carries transcripts of real
+speech, while every utterance in these two files is a scripted line already
+public in `scripts/replay_conversation.py`. There is nothing private in them and
+they are the evidence for a claim in the README.
+
 ### Limits of the after-figures
 
 These are not equivalent to the 34-turn session above and should not be pooled
